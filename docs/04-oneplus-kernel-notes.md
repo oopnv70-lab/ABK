@@ -109,14 +109,32 @@ issue #2 里那句话本身就是转述「据说」，发言者本人从未做�
 
 ## 4. 对本项目 workflow 的影响
 
-**必须改**：
-- 原来的 `make ... gki_defconfig all` → 改成 `tools/bazel build --config=fast //common:kernel_aarch64_dist`
-- 产物路径从 `common/out/arch/arm64/boot/Image` → 改成 `bazel-bin/common/kernel_aarch64_gki_artifacts/`
-- 这样编出来的直接就是 **boot.img**，连 mkbootimg 都不用手动做
+> **这一节已按实机结果修正。** 原来写的「必须改 Bazel」是**推断，已被自己的构建推翻**。
 
-**保持不变**：
-- 用 `OnePlusOSS/kernel_manifest` + `oneplus_ace5_b.xml` 现场 repo sync
-- 只编 GKI（`//common:...`），不碰 msm-kernel 的 vendor 部分
+### 实测结果（run `44970501662`，2026-11-22）
+
+用最朴素的 `make ... O=out gki_defconfig all` 在一加 Ace5 这棵树上**成功编完**：
+
+- job 结论 `success`，退出码 0
+- 产物 artifact `PKG110-none-2`，191,771,923 B
+- 「收集产物」步骤里带了 `[ -n "$IMAGE" ] || exit 1`，它没失败 → `Image` 确实生成了
+
+也就是说：**issue #2 里那批 `__stack_chk_guard` undefined 是 sm7675 那棵树的问题，
+不是 all 一加树的通病。Ace5 这棵树用传统 make 就能编过。**
+
+我之前的推理错在：拿另一台设备（sm7675）的失败当成「一加树必须用 Bazel」的通用结论。
+这是典型的跨设备外推，不能算证据。
+
+### 所以 workflow 现在保留两条路
+
+| builder | 状态 | 用途 |
+|---|---|---|
+| `make` | **已实证成功**，默认 | 快、产物已拿到、`common/out` 天然就是合格的 KDIR |
+| `bazel` | 未跑过，保留 | 一加维护者推荐的路线，用来交叉验证 make 的产物 |
+
+`make` 路线还有个实际好处：`common/out` 本身就是一次完整 make 的 objtree，
+`.config` / `vmlinux` / `Module.symvers` / `usr/include` 全在里面，
+**编 `kernelsu.ko` 需要的 KDIR 直接就是它**，不用再拼。
 
 ---
 
