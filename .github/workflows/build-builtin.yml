@@ -446,8 +446,15 @@ jobs:
           #   6.1.141-android14-11-o-g984c12362a16
           # KERNELVERSION=6.1.141，所以 LOCALVERSION 必须正好是后面那截。
           STOCK_LOCALVERSION="${STOCK_LOCALVERSION:--android14-11-o-g984c12362a16}"
-          scripts/config --file out/.config --set-str LOCALVERSION "$STOCK_LOCALVERSION"
-          scripts/config --file out/.config -d LOCALVERSION_AUTO
+          # 不能用 scripts/config --set-str：值以 '-' 开头会被当成命令行选项吞掉，
+          # .config 里根本不落（上一轮实测 release 变成裸 '6.1.141'）。直接改 .config。
+          if grep -q '^CONFIG_LOCALVERSION=' out/.config; then
+            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"${STOCK_LOCALVERSION}\"|" out/.config
+          else
+            echo "CONFIG_LOCALVERSION=\"${STOCK_LOCALVERSION}\"" >> out/.config
+          fi
+          sed -i 's|^CONFIG_LOCALVERSION_AUTO=y|# CONFIG_LOCALVERSION_AUTO is not set|' out/.config
+          echo "  .config: $(grep '^CONFIG_LOCALVERSION' out/.config | tr '\n' ' ')"
           # 源码树被我们改过，git 状态一定不干净；setlocalversion 会追加 -dirty，
           # 直接让它不产出任何后缀，release 只由 KERNELVERSION + LOCALVERSION 决定。
           echo '#!/bin/sh' > scripts/setlocalversion
@@ -459,7 +466,7 @@ jobs:
 
           echo "==== 关键配置确认 ===="
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E '^CONFIG_(KSU|KSU_SUSFS|KALLSYMS)' out/.config | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E '^CONFIG_(KSU|KSU_SUSFS|KALLSYMS|LOCALVERSION)' out/.config | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           if ! grep -q '^CONFIG_KSU=y' out/.config; then
             echo "::error::CONFIG_KSU 不是 y，KSU 不会被编进内核"
