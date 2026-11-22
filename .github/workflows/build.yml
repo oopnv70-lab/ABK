@@ -338,7 +338,11 @@ jobs:
           KSRC="$KERNEL_PLATFORM/common"
           MDIR="$GITHUB_WORKSPACE/sukisu/kernel"
 
-          ARGS=(O="$KDIR" M="$MDIR" src="$MDIR" CONFIG_KSU=m CC=clang)
+          # ARCH/LLVM 必须显式给：GitHub runner 是 x86_64，不传的话 Kbuild 用
+          # SUBARCH=x86_64 推 SRCARCH=x86，include 里全是 x86 的 arch 头，
+          # arm64 的 asm/compiler.h 自然找不到。
+          # src= 在 6.1 无意义（6.18+ 才有），去掉避免副作用。
+          ARGS=(ARCH=arm64 LLVM=1 O="$KDIR" M="$MDIR" CONFIG_KSU=m)
           if [ "$ENABLE_KPM" = "true" ]; then
             ARGS+=(CONFIG_KPM=y)
           fi
