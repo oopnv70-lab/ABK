@@ -407,15 +407,19 @@ jobs:
             fi
           done
 
-          # CONFIG_MODVERSIONS=n 是必须的，原因见 SukiSU 的 check_symbol：
-          #   Error: __versions section in kernelsu.ko must have size 0 (actual=12352)
-          # gki_defconfig 开了 MODVERSIONS，编出来的 .ko 会带 __versions 段，
-          # 记录每个导入符号的 CRC。带上它之后，内核加载时会逐符号比对 CRC，
-          # 只要有一处不一致就拒绝加载（KernelSU 的模块要跨内核通用，所以不要）。
-          # 命令行赋值优先级高于 include/config/auto.conf，能让 modpost 不再传 -m。
-          # 内核侧是允许的：没有 __versions 的模块被视为未做版本校验，正常加载。
+          # CONFIG_MODVERSIONS 必须置「空」，不能置 n：
+          #   scripts/Makefile.modpost: modpost-args = $(if $(CONFIG_MODVERSIONS),-m)
+          #   $(if ...) 只判断变量是否非空 —— 传 "n" 也是非空，照样加 -m，
+          #   所以上一轮传 CONFIG_MODVERSIONS=n 完全没生效（__versions 仍是 12352）。
+          #   必须传空值，$(if) 才判假。同样能压住 scripts/Makefile.build 里的
+          #   --version 参数（那里也是 ifdef 判断）。
+          #
+          # 为什么要关：check_symbol 要求 __versions 段 size 为 0。
+          # gki_defconfig 开了 MODVERSIONS，带着这个段的模块加载时内核会逐符号比 CRC，
+          # 一处不一致就拒绝加载。KernelSU 的模块要跨内核通用，所以不要。
+          # 内核侧允许：没有 __versions 的模块视为未做版本校验，正常加载。
           ARGS=(ARCH=arm64 LLVM=1 O="$KDIR" M="$MDIR" CONFIG_KSU=m
-            KBUILD_MODPOST_WARN=1 CONFIG_MODVERSIONS=n)
+            KBUILD_MODPOST_WARN=1 CONFIG_MODVERSIONS=)
           if [ "$ENABLE_KPM" = "true" ]; then
             ARGS+=(CONFIG_KPM=y)
           fi
@@ -469,6 +473,10 @@ jobs:
           # 刷进去会 Unknown symbol —— 必须当错误处理，不能静默放过。
           if [ -f "$KDIR/vmlinux" ]; then
             echo "== check_symbol =="
+            # 先把 __versions 段的真实大小打出来，避免又出现「改了半天没生效」
+            VSEC=$(llvm-readelf -S kernelsu.ko 2>/dev/null | grep -A1 '__versions' | tr -s ' ' | cut -d' ' -f6 | head -1)
+            echo "-- __versions 段大小：${VSEC:-未取到}"
+            echo "| __versions 段 | ${VSEC:-未取到} |" >> "$GITHUB_STEP_SUMMARY"
             clang tools/check_symbol.c -o check_symbol 2>&1 | tee -a "$LOG" || true
             if [ -x ./check_symbol ] && ./check_symbol kernelsu.ko "$KDIR/vmlinux" 2>&1 | tee -a "$LOG"; then
               echo "::notice::check_symbol 通过"
