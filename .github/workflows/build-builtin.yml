@@ -425,6 +425,20 @@ jobs:
             echo "  block/blk-mq.c 里没有 test_task_ux 导出，跳过"
           fi
 
+          # ---- 模块签名保护（WiFi/蓝牙卡死链的真正根因）----
+          # kernel/module/main.c:1281 对“未签名模块导出受保护符号”直接 return -EACCES；
+          # 受保护列表来自 android/abi_gki_protected_exports_aarch64（含 rfkill_alloc）。
+          # 自编译内核永远拿不到一加官方签名私钥→所有 stock 模块 sig_ok=0→rfkill.ko 被拒
+          # →cfg80211→qca_cld3 全断：能开机但没有 wlan0。
+          # 不提供该列表时 gen_gki_modules_headers.sh 走 -z 分支生成空数组，
+          # NR_PROTECTED_EXPORTS_SYMBOLS=0，该检查恒为 false（官方脚本原生支持此情形）。
+          for f in android/abi_gki_protected_exports_aarch64 android/abi_gki_protected_exports_x86_64; do
+            if [ -f "$f" ]; then
+              mv "$f" "$f.disabled"
+              echo "  已禁用受保护导出列表：$f（自编译内核无官方签名私钥）"
+            fi
+          done
+
           make -j"$(nproc)" LLVM=1 ARCH=arm64 O=out gki_defconfig >>"$LOG" 2>&1 || {
             echo "::error::gki_defconfig 失败"; tail -30 "$LOG"; exit 1; }
 
@@ -556,14 +570,35 @@ jobs:
           # ---- release 硬校验：必须与 stock 完全一致，否则 vendor 模块全拒 ----
           BANNER=$(strings "$COMMON/out/vmlinux" | grep -m1 '^Linux version ' || true)
           REL=$(printf '%s' "$BANNER" | awk '{print $3}')
-          WANT="${STOCK_LOCALVERSION:--android14-11-o-g984c12362a16}"
-          WANT_REL="6.1.141${WANT}"
+          # 实测证据（本机）：vendor 模块 vermagic 是 ...-g9005f72316d1，
+          # 内核 UTS_RELEASE 是 ...-g984c12362a16，两者不同但模块正常加载、WiFi 正常。
+          # 说明 Android KMI 只比对 `6.1.141-android14-11` 这段，git sha 不参与。
+          # 因此只要求 KMI 前缀一致；要求逐字节等于 stock 属过度严格（白拦两轮构建）。
+          KMI_PREFIX="6.1.141-android14-11"
           echo "kernel release: $REL" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$REL" != "$WANT_REL" ]; then
-            echo "::error::kernel release 是 '$REL'，但 stock 是 '$WANT_REL'：vermagic 不匹配会导致所有 vendor .ko 拒绝加载、卡第一屏"
+          case "$REL" in
+            "$KMI_PREFIX"*)
+              echo "::notice::kernel release KMI 段正确：$REL"
+              ;;
+            *)
+              echo "::error::kernel release 是 '$REL'，KMI 段不是 '$KMI_PREFIX'：vendor 模块会拒绝加载"
+              exit 1
+              ;;
+          esac
+
+          # ---- 模块签名保护硬校验：受保护导出列表必须为空 ----
+          PEX_H="$COMMON/out/include/generated/gki_module_protected_exports.h"
+          if [ ! -f "$PEX_H" ]; then
+            echo "::error::找不到 $PEX_H，无法确认模块签名保护状态"
             exit 1
           fi
-          echo "::notice::kernel release 与 stock 一致：$REL"
+          PEX_N=$(grep -cE '^[[:space:]]*"' "$PEX_H" || true)
+          echo "| protected exports 列表条目 | ${PEX_N} |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${PEX_N:-0}" -ne 0 ]; then
+            echo "::error::protected exports 列表仍有 ${PEX_N} 条：未签名模块（stock 的 rfkill.ko 等）会被 -EACCES 拒绝，WiFi 必挂"
+            exit 1
+          fi
+          echo "::notice::protected exports 列表为空，stock 模块不会被签名保护拦截"
 
           # ---- 重复导出硬校验：test_task_ux 不许再出现在 ksymtab ----
           # 用 nm 查 __ksymtab_ 前缀最准：只要还导出就一定有这个符号；
