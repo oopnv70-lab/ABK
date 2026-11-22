@@ -466,6 +466,28 @@ jobs:
           cd "$MDIR"
           ls -lh kernelsu.ko || { echo "::error::没生成 kernelsu.ko"; exit 1; }
 
+          # ── __versions 段：双保险 ────────────────────────────────────
+          # 正路是编模块时 CONFIG_MODVERSIONS=（空值），让 modpost 不传 -m。
+          # 但如果 Kbuild 某处仍判真（比如 ifdef/$(if) 差异、auto.conf 覆盖），
+          # 段还会在。这里做一次**确定性**收尾：段非 0 就 objcopy 删掉。
+          # 删段是安全的：模块自身不引用它（__start___versions 是内核侧符号），
+          # 没有该段的内核模块被视为「未做版本校验」，正常加载。
+          VSEC=$(llvm-readelf -S kernelsu.ko 2>/dev/null \
+            | awk '$2=="__versions"{print $6; exit}')
+          echo "-- 编译产出的 __versions 段大小：${VSEC:-(无该段)}"
+          if [ -n "$VSEC" ] && [ "$VSEC" != "000000" ] && [ "$((16#$VSEC))" -ne 0 ]; then
+            echo "::warning::__versions 段非空（$VSEC），用 objcopy 删除（CONFIG_MODVERSIONS= 未生效）"
+            llvm-objcopy --remove-section=__versions kernelsu.ko kernelsu.ko.stripped \
+              && mv kernelsu.ko.stripped kernelsu.ko
+            VSEC2=$(llvm-readelf -S kernelsu.ko 2>/dev/null \
+              | awk '$2=="__versions"{print $6; exit}')
+            echo "-- 删除后：${VSEC2:-(无该段)}"
+            echo "- __versions 原为 $VSEC，已 objcopy 删除 → ${VSEC2:-无}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "-- __versions 段已是空，CONFIG_MODVERSIONS= 生效"
+            echo "- __versions 段：自始为空（CONFIG_MODVERSIONS= 生效）" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           mkdir -p "$GITHUB_WORKSPACE/dist"
           cp kernelsu.ko "$GITHUB_WORKSPACE/dist/kernelsu.ko"
 
