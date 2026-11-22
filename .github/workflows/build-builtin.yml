@@ -16,12 +16,11 @@ name: Build PKG110 Kernel (builtin KSU)
 #   会把我们要的 builtin 分支切成 main。所以这里只做它等价的三件事
 #   （symlink / drivers/Makefile / drivers/Kconfig），不跑那个脚本。
 #
-# 第一版不做的事（明确写出来，避免又变成猜测）：
-#   1. 不开 SUSFS：builtin 的 Kconfig 里 CONFIG_KSU_SUSFS 是 default y，
-#      但 SUSFS 需要内核侧补丁（susfs4ksu），没打补丁就开会缺 <linux/susfs.h>。
-#      第一版显式 -d KSU_SUSFS，先确认 KSU 内置能编出来。
-#   2. 不打包 boot.img / AnyKernel3：先把「内置能不能编出来」这件事确认掉。
+# 第一版明确不做的事（避免又变成猜测）：
+#   1. 不打包 boot.img / AnyKernel3：先把「内置 KSU + SUSFS 能不能编出来」确认掉。
 #      编出来之后打包才有意义。
+#   2. SUSFS 冲突不自动改写：.rej 一律硬失败并列清单，逐个判断
+#      （厂商重构了函数的那种，脚本硬改就是埋雷）。
 # ---------------------------------------------------------------------------
 
 on:
@@ -44,10 +43,10 @@ on:
         required: true
         default: 'oneplus/sm8650'
       enable_susfs:
-        description: '打开 CONFIG_KSU_SUSFS（需先打 SUSFS 内核补丁，未打必失败）'
+        description: '打开 CONFIG_KSU_SUSFS（打 susfs4ksu 6.1 内核补丁；有 .rej 会硬失败并列清单）'
         required: true
         type: boolean
-        default: false
+        default: true
 
 concurrency:
   group: pkg110-kernel-builtin
@@ -174,6 +173,144 @@ jobs:
           echo "==== 挂接结果 ===="
           grep -n 'kernelsu' "$COMMON/drivers/Makefile" || true
           grep -n 'kernelsu' "$COMMON/drivers/Kconfig" || true
+
+      # ---------------------------------------------------------------------
+      # SUSFS 内核侧补丁。只有 enable_susfs=true 才跑。
+      #
+      # 为什么需要「垫片」：susfs4ksu 的补丁以 AOSP GKI 为上下文生成，
+      # 拿 trace/hooks 的 include 行当锚点，而厂商树会把这些行删掉 →
+      # patch 定位失败 → 整个 hunk 被丢 → 连带丢掉后续 hunk 依赖的宏
+      # （如 fs/namespace.c 的 CL_COPY_MNT_NS）。解法：补丁要的那行不存在时
+      # 临时插到 anchor 行后面，打完立刻删掉。
+      #
+      # 策略：这一步只负责「打上 + 暴露冲突」，不做任何自动改写源码。
+      # 有 .rej 就硬失败并列清单 —— 因为 .rej 属于「厂商重构了函数」，
+      # 必须逐个判断，不能脚本硬改。
+      # ---------------------------------------------------------------------
+      - name: 应用 SUSFS 内核补丁
+        if: env.ENABLE_SUSFS == 'true'
+        run: |
+          set -uo pipefail
+          COMMON="$KERNEL_PLATFORM/common"
+          PATCH="$GITHUB_WORKSPACE/susfs.patch"
+          LOG="$GITHUB_WORKSPACE/susfs-patch.log"
+
+          curl -fsSL --retry 3 --max-time 90 \
+            "https://gitlab.com/simonpunk/susfs4ksu/-/raw/gki-android14-6.1/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch" \
+            -o "$PATCH" || { echo "::error::下载 SUSFS 补丁失败"; exit 1; }
+          echo "SUSFS 补丁：$(wc -c < "$PATCH") 字节，$(grep -c '^diff --git' "$PATCH") 个文件"
+
+          cd "$COMMON"
+
+          SHIMMED=()
+          shim() {
+            local file="$1" line="$2" anchor="$3"
+            [ -f "$file" ] || return 0
+            # 补丁是否在「该文件的 diff 段落」里把这行当上下文（行首单空格）。
+            # 必须限定文件段落：同一行可能出现在别的文件里，全文匹配会误判。
+            awk -v h="diff --git a/$file b/$file" -v c=" $line" '
+              $0==h {s=1; next}
+              /^diff --git / {s=0}
+              s && $0==c {f=1}
+              END {exit(f?0:1)}' "$PATCH" || return 0
+            grep -qxF "$line" "$file" && return 0
+            grep -qxF "$anchor" "$file" || return 0
+            if python3 - "$file" "$line" "$anchor" <<'PY'
+          import sys
+          p, l, a = sys.argv[1:4]
+          L = open(p, encoding='utf-8', errors='surrogateescape').readlines()
+          for i, x in enumerate(L):
+              if x.rstrip('\n') == a:
+                  L.insert(i + 1, l + '\n')
+                  open(p, 'w', encoding='utf-8', errors='surrogateescape').writelines(L)
+                  sys.exit(0)
+          sys.exit(1)
+          PY
+            then
+              echo "  垫片注入: $file  ←  $line"
+              SHIMMED+=("$file"$'\t'"$line")
+            fi
+          }
+
+          echo "== 步骤 1/3：注入上下文垫片 =="
+          shim fs/namei.c          '#include <trace/hooks/syscall_check.h>' '#include "internal.h"'
+          shim fs/namespace.c      '#include <trace/hooks/blk.h>'          '#include "internal.h"'
+          shim fs/proc/task_mmu.c  '#include <trace/hooks/mm.h>'           '#include <linux/pkeys.h>'
+          shim fs/exec.c           '#include <linux/dma-buf.h>'            '#include <linux/ksm.h>'
+          echo "  共注入 ${#SHIMMED[@]} 处垫片"
+
+          echo "== 步骤 2/3：应用补丁 =="
+          patch -p1 --forward --no-backup-if-mismatch < "$PATCH" > "$LOG" 2>&1
+          PRC=$?
+          grep -E '^patching file' "$LOG" | wc -l | sed 's/^/  成功定位文件数: /'
+          grep -E 'FAILED|Hunk #[0-9]+ (succeeded|ignored)' "$LOG" | tail -25 || true
+          echo "  patch 退出码: $PRC"
+          if [ "$PRC" -gt 1 ]; then
+            echo "::error::patch 执行异常（rc=$PRC）"
+            tail -40 "$LOG"
+            exit 1
+          fi
+
+          echo "== 步骤 3/3：移除垫片 =="
+          for e in ${SHIMMED[@]+"${SHIMMED[@]}"}; do
+            f="${e%%$'\t'*}"; l="${e##*$'\t'}"
+            if python3 - "$f" "$l" <<'PY'
+          import sys
+          p, l = sys.argv[1:3]
+          L = open(p, encoding='utf-8', errors='surrogateescape').readlines()
+          for i, x in enumerate(L):
+              if x.rstrip('\n') == l:
+                  del L[i]
+                  open(p, 'w', encoding='utf-8', errors='surrogateescape').writelines(L)
+                  sys.exit(0)
+          sys.exit(1)
+          PY
+            then
+              echo "  垫片移除: $f  ←  $l"
+            else
+              echo "::error::垫片移除失败：$f ($l)"
+              exit 1
+            fi
+          done
+
+          # ---- 冲突清单：全部暴露，不做任何自动改写 ----
+          REJ=$(find . -name '*.rej' -not -path './.git/*' | sort)
+          N=$(printf '%s' "$REJ" | grep -c . || true)
+          {
+            echo ""
+            echo "### SUSFS 补丁结果"
+            echo "- 补丁：\`50_add_susfs_in_gki-android14-6.1.patch\`（$(grep -c '^diff --git' "$PATCH") 文件）"
+            echo "- 垫片注入：${#SHIMMED[@]} 处"
+            echo "- 未修复 .rej：**${N}** 个"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${N:-0}" -gt 0 ]; then
+            {
+              echo ""
+              echo "#### ❌ 冲突文件与 hunk"
+              echo '```'
+              for f in $REJ; do
+                echo "--- $f"
+                grep -E '^@@|^\+\+\+' "$f" | head -12
+              done
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::SUSFS 补丁有 ${N} 个 .rej，需逐个人工处理（清单见 Summary）"
+            exit 1
+          fi
+
+          # ---- 硬校验：宏/头文件真的到位才算成功 ----
+          fail=0
+          chk() { if eval "$2"; then echo "  ✓ $1"; else echo "  ✗ $1"; echo "::error::校验失败：$1"; fail=1; fi; }
+          chk "fs/susfs.c 存在"                 "test -f fs/susfs.c"
+          chk "include/linux/susfs.h 存在"      "test -f include/linux/susfs.h"
+          chk "include/linux/susfs_def.h 存在"  "test -f include/linux/susfs_def.h"
+          chk "fs/Makefile 挂了 susfs"          "grep -q susfs fs/Makefile"
+          chk "namespace.c 有 CL_COPY_MNT_NS"   "grep -q 'define CL_COPY_MNT_NS' fs/namespace.c"
+          chk "task_mmu.c 含 susfs_def.h"       "grep -q susfs_def.h fs/proc/task_mmu.c"
+          chk "无冲突标记"                      "! grep -rqE '^(<<<<<<< |>>>>>>> )' fs kernel mm security"
+          [ "$fail" -eq 0 ] || exit 1
+          echo "::notice::SUSFS 补丁应用完成，无冲突"
 
       # ---------------------------------------------------------------------
       # 配置 + 编译。CONFIG_KSU 必须显式置 y：
