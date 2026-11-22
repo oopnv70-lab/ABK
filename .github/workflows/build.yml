@@ -188,7 +188,11 @@ jobs:
           export CCACHE_MAXSIZE="12G"
           ccache -z
 
-          tools/bazel build --config="$BAZEL_CONFIG" //common:kernel_aarch64_dist \
+          # 官方文档原文是 tools/bazel run（不是 build）：
+          #   tools/bazel run //common:kernel_aarch64_dist [-- --destdir=$DIST_DIR]
+          # run 才会真正落地 dist 产物；build 只构建不导出。
+          tools/bazel run --config="$BAZEL_CONFIG" //common:kernel_aarch64_dist \
+            -- --destdir="$KERNEL_PLATFORM/dist" \
             2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
           ccache -s
