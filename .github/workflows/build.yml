@@ -407,8 +407,15 @@ jobs:
             fi
           done
 
+          # CONFIG_MODVERSIONS=n 是必须的，原因见 SukiSU 的 check_symbol：
+          #   Error: __versions section in kernelsu.ko must have size 0 (actual=12352)
+          # gki_defconfig 开了 MODVERSIONS，编出来的 .ko 会带 __versions 段，
+          # 记录每个导入符号的 CRC。带上它之后，内核加载时会逐符号比对 CRC，
+          # 只要有一处不一致就拒绝加载（KernelSU 的模块要跨内核通用，所以不要）。
+          # 命令行赋值优先级高于 include/config/auto.conf，能让 modpost 不再传 -m。
+          # 内核侧是允许的：没有 __versions 的模块被视为未做版本校验，正常加载。
           ARGS=(ARCH=arm64 LLVM=1 O="$KDIR" M="$MDIR" CONFIG_KSU=m
-            KBUILD_MODPOST_WARN=1)
+            KBUILD_MODPOST_WARN=1 CONFIG_MODVERSIONS=n)
           if [ "$ENABLE_KPM" = "true" ]; then
             ARGS+=(CONFIG_KPM=y)
           fi
