@@ -448,6 +448,92 @@ jobs:
           cp "$COMMON/out/.config" "$GITHUB_WORKSPACE/dist/.config"
           ls -lh "$GITHUB_WORKSPACE/dist"
 
+      # ---------------------------------------------------------------------
+      # 打包 AnyKernel3。
+      #
+      # 为什么必须这一步：Image 是裸内核，`fastboot flash boot Image` 会直接
+      # 失败 —— boot 分区要的是带 header 的容器（kernel_size / ramdisk /
+      # cmdline / page_size / header_version / AVB 签名）。
+      #
+      # 为什么用 AnyKernel3 而不是自己造 boot.img：
+      #   造 boot.img 需要知道本机的 header 参数（page size、header version、
+      #   原 cmdline、ramdisk、AVB 算法），任何一项猜错都是开不了机。
+      #   AnyKernel3 在设备上读「现有的 boot.img」，只把 kernel 换掉再写回，
+      #   header 原封不动沿用 —— 不需要我们采集任何参数。
+      #
+      # 为什么用 split_boot / flash_boot 而不是 dump_boot / write_boot：
+      #   Android 13+ / GKI 2.0 的 ramdisk 在 init_boot 分区，boot.img 里只有
+      #   kernel。dump_boot 会去解包 ramdisk（空），split_boot 只拆 kernel，
+      #   更契合这台机器。
+      # ---------------------------------------------------------------------
+      - name: 打包 AnyKernel3（可刷入 zip）
+        run: |
+          set -uo pipefail
+          cd "$GITHUB_WORKSPACE"
+          test -f dist/Image || { echo "::error::dist/Image 不存在，无法打包"; exit 1; }
+
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3 || {
+            echo "::error::克隆 AnyKernel3 失败"; exit 1; }
+          cd ak3
+          rm -rf .git .github patch ramdisk modules
+
+          cat > anykernel.sh <<'AK3'
+          ### AnyKernel3 Ramdisk Mod Script
+          ### PKG110 (OnePlus Ace5) - 自编译 GKI + 内置 SukiSU-Nova
+          properties() { '
+          kernel.string=PKG110 builtin KSU (self-built GKI)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=PKG110
+          device.name2=oneplus_ace5
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          # A/B 设备，boot 分区按 slot 自动选
+          BLOCK=boot;
+          IS_SLOT_DEVICE=1;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          # Android 13+ / GKI 2.0：ramdisk 在 init_boot，boot.img 只有 kernel
+          split_boot;
+          flash_boot;
+          AK3
+
+          cp "$GITHUB_WORKSPACE/dist/Image" ./Image
+          chmod +x tools/* 2>/dev/null || true
+
+          echo "=== 包内容 ==="
+          ls -l anykernel.sh Image
+          ls -l tools/ | head
+
+          ZIP="$GITHUB_WORKSPACE/dist/PKG110-$KSU_REF-AnyKernel3-$GITHUB_RUN_NUMBER.zip"
+          rm -f "$ZIP"
+          zip -r9 "$ZIP" . -x '*.git*' >/dev/null || { echo "::error::zip 失败"; exit 1; }
+          ls -lh "$ZIP"
+
+          {
+            echo ""
+            echo "### 打包"
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 包 | \`$(basename "$ZIP")\` |"
+            echo "| 大小 | $(du -h "$ZIP" | cut -f1) |"
+            echo "| 刷写方式 | AnyKernel3（split_boot/flash_boot，不改 ramdisk） |"
+            echo "| 设备校验 | PKG110 / oneplus_ace5 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::AnyKernel3 打包完成：$(basename "$ZIP")"
+
       - name: 上传产物
         if: always()
         uses: actions/upload-artifact@v4
