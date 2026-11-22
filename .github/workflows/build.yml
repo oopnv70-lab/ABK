@@ -472,17 +472,22 @@ jobs:
           # 段还会在。这里做一次**确定性**收尾：段非 0 就 objcopy 删掉。
           # 删段是安全的：模块自身不引用它（__start___versions 是内核侧符号），
           # 没有该段的内核模块被视为「未做版本校验」，正常加载。
-          VSEC=$(llvm-readelf -S kernelsu.ko 2>/dev/null \
-            | awk '$2=="__versions"{print $6; exit}')
+          # 注意：readelf 的索引列 "[ 4]" 里带空格，会被 awk 拆成两列，
+          # 所以不能用 $2=="__versions" 判断。改成先找 PROGBITS，
+          # 它后面依次是 addr / offset / size，取 PROGBITS 后第 3 个字段。
+          vsec_size() {
+            llvm-readelf -SW "$1" 2>/dev/null | awk '
+              /__versions /{ for(i=1;i<=NF;i++) if($i=="PROGBITS"){ print $(i+3); exit } }'
+          }
+          VSEC=$(vsec_size kernelsu.ko)
           echo "-- 编译产出的 __versions 段大小：${VSEC:-(无该段)}"
-          if [ -n "$VSEC" ] && [ "$VSEC" != "000000" ] && [ "$((16#$VSEC))" -ne 0 ]; then
+          if [ -n "$VSEC" ] && [ "$((16#$VSEC))" -ne 0 ]; then
             echo "::warning::__versions 段非空（$VSEC），用 objcopy 删除（CONFIG_MODVERSIONS= 未生效）"
             llvm-objcopy --remove-section=__versions kernelsu.ko kernelsu.ko.stripped \
               && mv kernelsu.ko.stripped kernelsu.ko
-            VSEC2=$(llvm-readelf -S kernelsu.ko 2>/dev/null \
-              | awk '$2=="__versions"{print $6; exit}')
+            VSEC2=$(vsec_size kernelsu.ko)
             echo "-- 删除后：${VSEC2:-(无该段)}"
-            echo "- __versions 原为 $VSEC，已 objcopy 删除 → ${VSEC2:-无}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- __versions 原为 0x$VSEC，已 objcopy 删除 → ${VSEC2:-无该段}" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "-- __versions 段已是空，CONFIG_MODVERSIONS= 生效"
             echo "- __versions 段：自始为空（CONFIG_MODVERSIONS= 生效）" >> "$GITHUB_STEP_SUMMARY"
