@@ -455,11 +455,18 @@ jobs:
           fi
           sed -i 's|^CONFIG_LOCALVERSION_AUTO=y|# CONFIG_LOCALVERSION_AUTO is not set|' out/.config
           echo "  .config: $(grep '^CONFIG_LOCALVERSION' out/.config | tr '\n' ' ')"
-          # 源码树被我们改过，git 状态一定不干净；setlocalversion 会追加 -dirty，
-          # 直接让它不产出任何后缀，release 只由 KERNELVERSION + LOCALVERSION 决定。
-          echo '#!/bin/sh' > scripts/setlocalversion
-          echo 'echo ""' >> scripts/setlocalversion
+          # 这份树的 kernel release 后缀**只由 scripts/setlocalversion 产出**：
+          # Makefile 里 filechk_kernel.release = echo "$(KERNELVERSION)$(setlocalversion ...)"。
+          # 它读 include/config/auto.conf 的 CONFIG_LOCALVERSION，再叠加 BRANCH/KMI/git。
+          # 源码树被我们改过（SUSFS/删导出/软链），git 状态必然 dirty，机制算出来一定不是 stock。
+          # 所以这里直接让脚本输出与 stock 完全一致的后缀，不赌任何一处自动推导。
+          printf '#!/bin/sh\necho "%s"\n' "$STOCK_LOCALVERSION" > scripts/setlocalversion
           chmod +x scripts/setlocalversion
+          echo "  setlocalversion 输出: $(scripts/setlocalversion)"
+          if [ "$(scripts/setlocalversion)" != "$STOCK_LOCALVERSION" ]; then
+            echo "::error::setlocalversion 替换后输出异常，期望 '$STOCK_LOCALVERSION'"
+            exit 1
+          fi
 
           make -j"$(nproc)" LLVM=1 ARCH=arm64 O=out olddefconfig >>"$LOG" 2>&1 || {
             echo "::error::olddefconfig 失败"; tail -30 "$LOG"; exit 1; }
