@@ -6,6 +6,8 @@ name: Build PKG110 Kernel
 # 3. 变体（KSU/SUSFS）用输入开关控制，不复制多份 workflow
 
 on:
+  # 只允许手动触发：GKI 一次构建 40~90 分钟，
+  # GitHub 免费额度每月 2000 分钟，绝不能让每次 commit 都自动烧额度。
   workflow_dispatch:
     inputs:
       device_manifest:
@@ -17,7 +19,7 @@ on:
         required: true
         default: 'oneplus/sm8650'
       ksu_variant:
-        description: 'KSU 变体（none = 纯净基线，先跑这个）'
+        description: 'KSU 变体（none = 纯净 GKI 基线，先跑这个）'
         required: true
         type: choice
         default: 'none'
@@ -29,10 +31,11 @@ on:
         required: true
         type: boolean
         default: false
-  push:
-    branches: [ main ]
-    paths:
-      - '.github/workflows/build.yml'
+
+# 同一分支同一时刻只允许一个构建在跑，避免重复启动把额度烧光
+concurrency:
+  group: pkg110-kernel-build
+  cancel-in-progress: false
 
 permissions:
   contents: read
