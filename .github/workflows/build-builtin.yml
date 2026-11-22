@@ -279,7 +279,51 @@ jobs:
             fi
           done
 
-          # ---- 冲突清单：全部暴露，不做任何自动改写 ----
+          # ---- 定点处理已知无害冲突：fs/proc/base.c 的 include-only hunk ----
+          # 该 hunk 只在 include 段插一段条件编译的 susfs_def.h，与厂商逻辑无关；
+          # 打不上纯粹因为一加改动了它上面的 include 行。
+          # 纪律：只有「新增行全部是 include/条件编译/空行」才自动落位，否则不碰。
+          RB=fs/proc/base.c.rej
+          if [ -f "$RB" ]; then
+            if grep -E '^\+' "$RB" | grep -vE '^\+\+\+' | grep -vE '^\+(#include|#if|#endif|#else)' | grep -vE '^\+[[:space:]]*$' | grep -q .; then
+              echo "  fs/proc/base.c.rej 含非 include 内容，不自动处理"
+            else
+              python3 - "$RB" <<'PY'
+          import sys
+          rej = sys.argv[1]
+          target = 'fs/proc/base.c'
+          f = open(target, encoding='utf-8', errors='surrogateescape')
+          L = f.readlines()
+          f.close()
+          if any('#include <linux/susfs_def.h>' in x for x in L):
+              sys.exit(0)
+          add = []
+          for line in open(rej, encoding='utf-8', errors='surrogateescape'):
+              if line.startswith('+') and not line.startswith('+++'):
+                  add.append(line[1:])
+          while add and add[-1].strip() == '':
+              add.pop()
+          add.append('\n')
+          idx = None
+          for i, x in enumerate(L):
+              if x.rstrip('\n') == '#include "internal.h"':
+                  idx = i
+                  break
+          if idx is None:
+              last = None
+              for i, x in enumerate(L):
+                  if x.startswith('#include '):
+                      last = i
+              idx = (last + 1) if last is not None else 1
+          L[idx:idx] = add
+          open(target, 'w', encoding='utf-8').writelines(L)
+          print('  fs/proc/base.c：插入 %d 行（锚点行 %d）' % (len(add), idx))
+          PY
+              rm -f "$RB" && echo "  已消化 $RB"
+            fi
+          fi
+
+          # ---- 冲突清单：其余一律暴露，不做任何自动改写 ----
           REJ=$(find . -name '*.rej' -not -path './.git/*' | sort)
           N=$(printf '%s' "$REJ" | grep -c . || true)
           {
