@@ -398,8 +398,10 @@ jobs:
             echo "::error::gki_defconfig 失败"; tail -30 "$LOG"; exit 1; }
 
           # 显式开 KSU；SUSFS 按开关处理（默认关，理由见文件头注释）
+          # 不加 KALLSYMS_ALL：那是把 static/局部符号也塞进 kallsyms，
+          # 会让内核凭空多出一整张完整符号表，官方 gki_defconfig 本来就不开，
+          # 内置 KSU 也不需要它。
           scripts/config --file out/.config -e KSU
-          scripts/config --file out/.config -e KALLSYMS_ALL
           if [ "$ENABLE_SUSFS" = "true" ]; then
             scripts/config --file out/.config -e KSU_SUSFS
           else
