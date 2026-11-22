@@ -47,6 +47,10 @@ on:
         required: true
         type: boolean
         default: true
+      stock_localversion:
+        description: 'stock 内核 release 的后缀，必须与设备原厂 uname -r 的后半截逐字一致'
+        required: false
+        default: '-android14-11-o-g984c12362a16'
 
 concurrency:
   group: pkg110-kernel-builtin
@@ -62,6 +66,10 @@ env:
   MANIFEST_BRANCH: ${{ inputs.manifest_branch || 'oneplus/sm8650' }}
   KSU_REF: ${{ inputs.ksu_ref || 'builtin' }}
   ENABLE_SUSFS: ${{ inputs.enable_susfs == true && 'true' || 'false' }}
+  # stock 内核 release 的后半截（KERNELVERSION=6.1.141 之外的部分）。
+  # 必须与设备原厂内核逐字一致：内核 check_modinfo() 拿它做 vermagic 比对，
+  # 不匹配则 vendor_dlkm 里所有 .ko 拒绝加载 → 卡第一屏无限重启（无 panic）。
+  STOCK_LOCALVERSION: ${{ inputs.stock_localversion || '-android14-11-o-g984c12362a16' }}
 
 jobs:
   build-builtin:
@@ -408,6 +416,21 @@ jobs:
             scripts/config --file out/.config -d KSU_SUSFS
           fi
 
+          # ---- 让 kernel release 精确等于 stock，否则 vendor 模块全部拒绝加载 ----
+          # 内核 check_modinfo() 逐字节比较 vermagic；不匹配就 -ENOEXEC，
+          # vendor_dlkm 里所有 .ko 加载失败 → 卡第一屏无限重启（无 panic）。
+          # stock（也就是能开机的那颗）release 是：
+          #   6.1.141-android14-11-o-g984c12362a16
+          # KERNELVERSION=6.1.141，所以 LOCALVERSION 必须正好是后面那截。
+          STOCK_LOCALVERSION="${STOCK_LOCALVERSION:--android14-11-o-g984c12362a16}"
+          scripts/config --file out/.config --set-str LOCALVERSION "$STOCK_LOCALVERSION"
+          scripts/config --file out/.config -d LOCALVERSION_AUTO
+          # 源码树被我们改过，git 状态一定不干净；setlocalversion 会追加 -dirty，
+          # 直接让它不产出任何后缀，release 只由 KERNELVERSION + LOCALVERSION 决定。
+          echo '#!/bin/sh' > scripts/setlocalversion
+          echo 'echo ""' >> scripts/setlocalversion
+          chmod +x scripts/setlocalversion
+
           make -j"$(nproc)" LLVM=1 ARCH=arm64 O=out olddefconfig >>"$LOG" 2>&1 || {
             echo "::error::olddefconfig 失败"; tail -30 "$LOG"; exit 1; }
 
@@ -492,6 +515,18 @@ jobs:
             exit 1
           fi
           echo "::notice::KSU 已链入内核（包名 ${PKG_N} 处 / 符号 ${SYM_N} 个）"
+
+          # ---- release 硬校验：必须与 stock 完全一致，否则 vendor 模块全拒 ----
+          BANNER=$(strings "$COMMON/out/vmlinux" | grep -m1 '^Linux version ' || true)
+          REL=$(printf '%s' "$BANNER" | awk '{print $3}')
+          WANT="${STOCK_LOCALVERSION:--android14-11-o-g984c12362a16}"
+          WANT_REL="6.1.141${WANT}"
+          echo "kernel release: $REL" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$REL" != "$WANT_REL" ]; then
+            echo "::error::kernel release 是 '$REL'，但 stock 是 '$WANT_REL'：vermagic 不匹配会导致所有 vendor .ko 拒绝加载、卡第一屏"
+            exit 1
+          fi
+          echo "::notice::kernel release 与 stock 一致：$REL"
 
           # ---- SUSFS 校验：只有 enable_susfs=true 才要求 ----
           if [ "${ENABLE_SUSFS:-false}" = "true" ]; then
