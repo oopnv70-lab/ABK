@@ -374,47 +374,41 @@ jobs:
           # arm64 的 asm/compiler.h 自然找不到。
           # src= 在 6.1 无意义（6.18+ 才有），去掉避免副作用。
           #
-          # KBUILD_EXTRA_SYMBOLS 必须显式给，这是 6.1 scripts/Makefile.modpost 的
-          # extmod 分支决定的：
-          #   module.symvers-if-present := $(wildcard Module.symvers)   ← 相对路径
-          #   modpost-args += -e $(addprefix -i ,$(module.symvers-if-present) $(KBUILD_EXTRA_SYMBOLS))
-          # modpost 是在「模块目录」下执行的（日志里 MODPOST .../sukisu/kernel/Module.symvers
-          # 就是证据），于是 $(wildcard Module.symvers) 找的是 sukisu/kernel/Module.symvers
-          # ——一个刚 clone 的空目录，根本没有。结果内核的导出符号一个都没读进去，
-          # init_mm / __set_fixmap / strncpy_from_user_nofault 全被报 undefined。
-          # KBUILD_EXTRA_SYMBOLS 用绝对路径，不受工作目录影响，是官方正规解法。
-          SYM=""
-          # 只取一个文件：6.1 的 Module.symvers 是「vmlinux 导出 + 模块导出」的合并集合，
-          # 再把 vmlinux.symvers 一起传进去会让同一符号出现两次，modpost 直接报
-          #   ERROR: modpost: net/nfc/nfc: 'nfc_class' exported twice.
-          # 而这个错误类型 -w 降不下去，会直接把编译顶崩。
-          for f in "$KDIR/Module.symvers" "$KDIR/vmlinux.symvers"; do
-            if [ -s "$f" ]; then
-              SYM="$f"
-              break
+          # 关于符号表（这里我判断错过一次，纠正记录）：
+          #   我曾以为 modpost 在模块目录下运行，$(wildcard Module.symvers) 是相对路径
+          #   所以读不到内核符号表 —— 错。实测证明它读到的是 $KDIR/Module.symvers
+          #   （make -C 切换了工作目录）。日志里 MODPOST .../sukisu/kernel/Module.symvers
+          #   只是「输出文件名」，不是工作目录。
+          #
+          #   第一轮那 69 条 undefined 的真实原因也不是「读不到表」，而是：
+          #   这颗树 make all 出的 Module.symvers 只有一万多行，GKI 只导出被 vendor
+          #   模块实际引用到的符号，init_mm / __set_fixmap 这类不在表里。
+          #   SukiSU 有 infra/symbol_resolver.o，运行时用 kallsyms 解析，不依赖它。
+          #
+          #   第二轮的 15729 条 "exported twice" 是我用 KBUILD_EXTRA_SYMBOLS 把同一份表
+          #   又塞了一遍造成的 —— 所以现在一个符号表参数都不传。
+          # ── 关于符号表，这里踩过一个坑，记下来 ──────────────────────────
+          # modpost 的工作目录其实就是 $KDIR，它自己会 $(wildcard Module.symvers)
+          # 读到 out/Module.symvers。所以「不要再通过 KBUILD_EXTRA_SYMBOLS 塞同一份」，
+          # 否则每个符号会被加载两遍，modpost 报 15729 条
+          #   ERROR: modpost: vmlinux: 'init_task' exported twice.
+          # 而这个错误 -w 降不下来，构建直接失败。
+          #
+          # 另外：这颗树 make all 出的 Module.symvers 只有一万多行，且不含 init_mm /
+          # __set_fixmap 这类没被 vendor 模块引用过的符号（GKI 只导出被用到的）。
+          # 所以那 69 条 undefined 是预期现象 —— SukiSU 有 infra/symbol_resolver.o，
+          # 运行时用 kallsyms 解析，不依赖编译期导出表。
+          echo "-- KDIR/Module.symvers：$(wc -l < "$KDIR/Module.symvers" 2>/dev/null || echo 0) 行（modpost 会自动读取）"
+          for s in init_mm __set_fixmap nfc_class; do
+            if grep -qE "[[:space:]]${s}[[:space:]]" "$KDIR/Module.symvers" 2>/dev/null; then
+              echo "-- 符号 $s：在表内"
+            else
+              echo "-- 符号 $s：不在表内（将被记为 undefined，运行时由 kallsyms 解析）"
             fi
           done
-          if [ -z "$SYM" ]; then
-            echo "::error::\$KDIR 里既没有 Module.symvers 也没有 vmlinux.symvers"
-            exit 1
-          fi
-          echo "-- 符号表来源：$SYM（$(wc -l < "$SYM") 行）"
-
-          # 再按符号名去重（第 2 列）。一加这棵树自己就有重复导出，
-          # 原样喂进去一样会触发 exported twice。
-          # 只保留第一条，不动原文件。
-          dedup="$GITHUB_WORKSPACE/symvers.dedup"
-          awk -F'\t' 'NF>=3 && !seen[$2]++' "$SYM" > "$dedup"
-          echo "-- 去重后：$(wc -l < "$dedup") 行（原 $(wc -l < "$SYM") 行）"
-          {
-            echo ""
-            echo "| 符号表 | 原始行 | 去重后 |"
-            echo "|---|---|---|"
-            echo "| \`$(basename "$SYM")\` | $(wc -l < "$SYM") | $(wc -l < "$dedup") |"
-          } >> "$GITHUB_STEP_SUMMARY"
 
           ARGS=(ARCH=arm64 LLVM=1 O="$KDIR" M="$MDIR" CONFIG_KSU=m
-            KBUILD_EXTRA_SYMBOLS="$dedup" KBUILD_MODPOST_WARN=1)
+            KBUILD_MODPOST_WARN=1)
           if [ "$ENABLE_KPM" = "true" ]; then
             ARGS+=(CONFIG_KPM=y)
           fi
