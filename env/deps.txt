@@ -1,0 +1,22 @@
+# 环境快照
+
+日期: 2026-11-22T00:57:42Z
+
+Linux localhost 6.1.141-android14-11-o-g984c12362a16 #1 SMP PREEMPT Wed Jun 10 09:47:31 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+
+## 工具版本
+git      git version 2.43.0
+repo     
+make     GNU Make 4.3
+python3  Python 3.12.3
+bison    bison (GNU Bison) 3.8.2
+flex     flex 2.6.4
+bc       bc 1.07.1
+cpio     cpio (GNU cpio) 2.15
+lz4      *** LZ4 command line interface 64-bits v1.9.4, by Yann Collet ***
+pahole   v1.25
+ccache   ccache version 4.9.1
+
+MemTotal:       15561152 kB
+MemAvailable:    4709196 kB
+/dev/block/dm-72  219G  189G   31G  86% /

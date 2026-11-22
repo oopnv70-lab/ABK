@@ -1,0 +1,9 @@
+# 大件与中间产物不入版本库
+out/
+dist/
+logs/
+.ccache/
+src/
+artifacts/*.img
+artifacts/*.zip
+*.log

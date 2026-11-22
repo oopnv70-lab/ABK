@@ -1,0 +1,202 @@
+name: Build PKG110 Kernel
+
+# 设计原则：
+# 1. 源码只在 runner 上现场 repo sync，本地仓库里不存任何内核源码
+# 2. 每次构建把「manifest / 分支 / 两个核心仓库的 commit」写进 summary，产物可回溯
+# 3. 变体（KSU/SUSFS）用输入开关控制，不复制多份 workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_manifest:
+        description: 'OnePlusOSS kernel_manifest 里的设备 xml'
+        required: true
+        default: 'oneplus_ace5_b.xml'
+      manifest_branch:
+        description: 'kernel_manifest 分支'
+        required: true
+        default: 'oneplus/sm8650'
+      ksu_variant:
+        description: 'KSU 变体（none = 纯净基线，先跑这个）'
+        required: true
+        type: choice
+        default: 'none'
+        options:
+          - none
+          - SukiSU-Nova
+      enable_susfs:
+        description: '是否打 SUSFS 补丁（依赖 KSU 变体）'
+        required: true
+        type: boolean
+        default: false
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+env:
+  KP_DIR: ${{ github.workspace }}/kp
+  KERNEL_PLATFORM: ${{ github.workspace }}/kp/kernel_platform
+  # 手动触发时用输入值；push 触发时 inputs 为空，回落到默认值
+  DEVICE_MANIFEST: ${{ inputs.device_manifest || 'oneplus_ace5_b.xml' }}
+  MANIFEST_BRANCH: ${{ inputs.manifest_branch || 'oneplus/sm8650' }}
+  KSU_VARIANT: ${{ inputs.ksu_variant || 'none' }}
+  ENABLE_SUSFS: ${{ inputs.enable_susfs || 'false' }}
+
+jobs:
+  build:
+    name: build-${{ env.KSU_VARIANT }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: 检出本仓库（只要 workflow/脚本，不要源码）
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        run: |
+          set -euxo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装构建依赖
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            libc6-dev libncurses-dev libssl-dev libelf-dev bc cpio rsync \
+            python3 python3-pip dwarves lz4 device-tree-compiler ccache
+
+      - name: 安装 repo 工具
+        run: |
+          set -euxo pipefail
+          mkdir -p ~/bin
+          curl -fsSL https://raw.githubusercontent.com/GerritCodeReview/git-repo/main/repo \
+               -o ~/bin/repo
+          chmod +x ~/bin/repo
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          ~/bin/repo --version
+
+      - name: 准备 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.DEVICE_MANIFEST }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.DEVICE_MANIFEST }}-
+
+      - name: 现场拉取一加内核源码（repo sync）
+        run: |
+          set -euxo pipefail
+          mkdir -p "$KP_DIR"
+          cd "$KP_DIR"
+
+          git config --global user.name  "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+          repo init \
+            -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b "$MANIFEST_BRANCH" \
+            -m "$DEVICE_MANIFEST" \
+            --depth=1 \
+            --no-repo-verify
+
+          repo sync -c --no-tags --optimized-fetch -j"$(nproc)" --force-sync
+
+          echo "==== 拉取结果 ===="
+          du -sh "$KP_DIR"
+          df -h /
+          grep -E 'name=|revision=' ".repo/manifests/$DEVICE_MANIFEST" | head -30
+
+      - name: 记录源码版本
+        run: |
+          set -euo pipefail
+          {
+            echo "### 构建指纹"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| manifest | \`$DEVICE_MANIFEST\` @ \`$MANIFEST_BRANCH\` |"
+            echo "| KSU 变体 | \`$KSU_VARIANT\` |"
+            echo "| SUSFS | \`$ENABLE_SUSFS\` |"
+            for d in common msm-kernel; do
+              if [ -d "$KERNEL_PLATFORM/$d/.git" ]; then
+                ver=$(sed -n '2p;3p;4p' "$KERNEL_PLATFORM/$d/Makefile" 2>/dev/null | tr -d '\n ')
+                sha=$(git -C "$KERNEL_PLATFORM/$d" rev-parse HEAD)
+                br=$(git -C "$KERNEL_PLATFORM/$d" rev-parse --abbrev-ref HEAD)
+                echo "| $d | \`$br\` \`$sha\` ($ver) |"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 编译内核
+        run: |
+          set -euxo pipefail
+          COMMON="$KERNEL_PLATFORM/common"
+          cd "$COMMON"
+
+          CLANG_DIR="$KERNEL_PLATFORM/prebuilts/clang/host/linux-x86/clang-r487747c/bin"
+          export PATH="$CLANG_DIR:$PATH"
+          clang --version
+
+          PAHOLE_BIN="$KERNEL_PLATFORM/prebuilts/kernel-build-tools/linux-x86/bin/pahole"
+
+          export CCACHE_DIR="$HOME/.ccache"
+          export CCACHE_MAXSIZE="10G"
+          ccache -z
+
+          make -j"$(nproc)" \
+            LLVM=1 \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" \
+            LD=ld.lld HOSTLD=ld.lld \
+            PAHOLE="$PAHOLE_BIN" \
+            O=out \
+            gki_defconfig all 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+          ccache -s
+
+      - name: 收集产物
+        run: |
+          set -euo pipefail
+          OUT="$KERNEL_PLATFORM/common/out"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+
+          IMAGE=$(find "$OUT/arch/arm64/boot" -maxdepth 1 -name 'Image*' | head -1)
+          [ -n "$IMAGE" ] || { echo "::error::没找到 Image"; exit 1; }
+          cp "$IMAGE" "$GITHUB_WORKSPACE/dist/Image"
+
+          cp -v "$OUT/System.map" "$GITHUB_WORKSPACE/dist/" 2>/dev/null || true
+          cp -v "$OUT/Module.symvers" "$GITHUB_WORKSPACE/dist/" 2>/dev/null || true
+          if [ -f "$OUT/vmlinux" ]; then cp "$OUT/vmlinux" "$GITHUB_WORKSPACE/dist/"; fi
+
+          ls -lh "$GITHUB_WORKSPACE/dist"
+
+      - name: 打包 AnyKernel3
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth=1 https://github.com/Xiaomichael/AnyKernel3 anykernel3
+          rm -rf anykernel3/.git
+          cp dist/Image anykernel3/Image
+          ( cd anykernel3 && zip -q -r9 "../Image-${GITHUB_RUN_NUMBER}.zip" ./* )
+          ls -lh ./*.zip
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: PKG110-${{ env.KSU_VARIANT }}-${{ github.run_number }}
+          path: |
+            dist/*
+            *.zip
+            build.log
+          if-no-files-found: error
