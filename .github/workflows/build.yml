@@ -253,6 +253,14 @@ jobs:
             echo "::error::构建结束但找不到 Image，请看上方候选目录清单"
             exit 1
           fi
+          # 必须转成绝对路径：这一步在 $KERNEL_PLATFORM 下用相对路径找到的 Image，
+          # 直接写进 output 后，下一步骤（工作目录回到 workspace）就找不到它，
+          # 结果 Image 静默没被收进 dist，artifact 只剩两个 log。
+          IMAGE="$(readlink -f "$IMAGE")"
+          if [ ! -f "$IMAGE" ]; then
+            echo "::error::Image 绝对路径解析失败：$IMAGE"
+            exit 1
+          fi
           echo "IMAGE=$IMAGE" >> "$GITHUB_OUTPUT"
           echo "找到内核镜像：$IMAGE ($(du -h "$IMAGE" | cut -f1))"
 
@@ -312,12 +320,20 @@ jobs:
           # 关键符号是否真的导出：这几个是 SukiSU 硬依赖且标准内核必然导出的，
           # 缺任何一个都说明符号表拿错了文件（不是一加删了导出）
           echo "--- 抽查导出符号 ---"
-          for s in init_mm __set_fixmap kallsyms_lookup_size_offset strncpy_from_user_nofault; do
+          {
+            echo ""
+            echo "### KDIR 符号表实测"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for s in init_mm __set_fixmap kallsyms_lookup_size_offset strncpy_from_user_nofault nfc_class; do
             hit=""
             for f in "$KDIR/vmlinux.symvers" "$KDIR/Module.symvers"; do
               [ -f "$f" ] && grep -qE "[[:space:]]${s}[[:space:]]" "$f" && hit="$hit $(basename "$f")"
             done
             printf '%-32s %s\n' "$s" "${hit:-NOT FOUND}"
+            echo "| \`$s\` | ${hit:-NOT FOUND} |" >> "$GITHUB_STEP_SUMMARY"
           done
 
           echo "KDIR=$KDIR" >> "$GITHUB_OUTPUT"
@@ -368,21 +384,37 @@ jobs:
           # init_mm / __set_fixmap / strncpy_from_user_nofault 全被报 undefined。
           # KBUILD_EXTRA_SYMBOLS 用绝对路径，不受工作目录影响，是官方正规解法。
           SYM=""
-          for f in "$KDIR/vmlinux.symvers" "$KDIR/Module.symvers"; do
+          # 只取一个文件：6.1 的 Module.symvers 是「vmlinux 导出 + 模块导出」的合并集合，
+          # 再把 vmlinux.symvers 一起传进去会让同一符号出现两次，modpost 直接报
+          #   ERROR: modpost: net/nfc/nfc: 'nfc_class' exported twice.
+          # 而这个错误类型 -w 降不下去，会直接把编译顶崩。
+          for f in "$KDIR/Module.symvers" "$KDIR/vmlinux.symvers"; do
             if [ -s "$f" ]; then
-              SYM="${SYM:+$SYM }$f"
-              echo "-- 符号表输入：$f（$(wc -l < "$f") 行）"
-            else
-              echo "-- 符号表缺失/为空：$f"
+              SYM="$f"
+              break
             fi
           done
           if [ -z "$SYM" ]; then
-            echo "::error::\$KDIR 里既没有 vmlinux.symvers 也没有 Module.symvers，无法编外部模块"
+            echo "::error::\$KDIR 里既没有 Module.symvers 也没有 vmlinux.symvers"
             exit 1
           fi
+          echo "-- 符号表来源：$SYM（$(wc -l < "$SYM") 行）"
+
+          # 再按符号名去重（第 2 列）。一加这棵树自己就有重复导出，
+          # 原样喂进去一样会触发 exported twice。
+          # 只保留第一条，不动原文件。
+          dedup="$GITHUB_WORKSPACE/symvers.dedup"
+          awk -F'\t' 'NF>=3 && !seen[$2]++' "$SYM" > "$dedup"
+          echo "-- 去重后：$(wc -l < "$dedup") 行（原 $(wc -l < "$SYM") 行）"
+          {
+            echo ""
+            echo "| 符号表 | 原始行 | 去重后 |"
+            echo "|---|---|---|"
+            echo "| \`$(basename "$SYM")\` | $(wc -l < "$SYM") | $(wc -l < "$dedup") |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           ARGS=(ARCH=arm64 LLVM=1 O="$KDIR" M="$MDIR" CONFIG_KSU=m
-            KBUILD_EXTRA_SYMBOLS="$SYM" KBUILD_MODPOST_WARN=1)
+            KBUILD_EXTRA_SYMBOLS="$dedup" KBUILD_MODPOST_WARN=1)
           if [ "$ENABLE_KPM" = "true" ]; then
             ARGS+=(CONFIG_KPM=y)
           fi
@@ -494,6 +526,10 @@ jobs:
           SRC="${{ steps.artifacts.outputs.IMAGE }}"
           if [ -n "${SRC:-}" ] && [ -f "$SRC" ]; then
             cp -v "$SRC" "$GITHUB_WORKSPACE/dist/Image"
+            echo "Image 已收集：$(du -h "$GITHUB_WORKSPACE/dist/Image" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::收集产物失败：IMAGE='${SRC:-<空>}'，文件不存在"
+            echo "### ❌ Image 没有进 dist（IMAGE='${SRC:-<空>}'）" >> "$GITHUB_STEP_SUMMARY"
           fi
           ls -lh "$GITHUB_WORKSPACE/dist" || true
 
