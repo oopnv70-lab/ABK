@@ -206,6 +206,18 @@ jobs:
 
           cd "$COMMON"
 
+          # ---- SUSFS 内核侧实现文件：不在 50_add_...patch 里，必须单独取 ----
+          # 该补丁只改已有文件（27 个），fs/susfs.c / include/linux/susfs.h /
+          # susfs_def.h 是「新增文件」，susfs4ksu 把它们放在内核补丁目录下单独提供。
+          # 少了这三个，patch 能打完但 fs/Makefile 挂的 susfs.o 编不出来。
+          SUSFS_RAW="https://gitlab.com/simonpunk/susfs4ksu/-/raw/gki-android14-6.1/kernel_patches"
+          for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
+            mkdir -p "$(dirname "$f")"
+            curl -fsSL --retry 3 --max-time 90 "$SUSFS_RAW/$f" -o "$f" \
+              || { echo "::error::下载 SUSFS 源文件失败：$f"; exit 1; }
+            echo "  SUSFS 源文件：$f  $(wc -c < "$f") 字节"
+          done
+
           SHIMMED=()
           shim() {
             local file="$1" line="$2" anchor="$3"
@@ -478,6 +490,21 @@ jobs:
             exit 1
           fi
           echo "::notice::KSU 已链入内核（包名 ${PKG_N} 处 / 符号 ${SYM_N} 个）"
+
+          # ---- SUSFS 校验：只有 enable_susfs=true 才要求 ----
+          if [ "${ENABLE_SUSFS:-false}" = "true" ]; then
+            SUSFS_OBJ="$COMMON/out/fs/susfs.o"
+            SUSFS_SYM=$(nm "$COMMON/out/vmlinux" 2>/dev/null | grep -cE ' [tTdDbBrR] susfs_' || true)
+            {
+              echo "| out/fs/susfs.o | $([ -f "$SUSFS_OBJ" ] && du -h "$SUSFS_OBJ" | cut -f1 || echo 缺失) |"
+              echo "| vmlinux 中 susfs_* 符号 | ${SUSFS_SYM} 个 |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "${SUSFS_SYM:-0}" -eq 0 ]; then
+              echo "::error::ENABLE_SUSFS=true 但 vmlinux 里没有 susfs_* 符号，SUSFS 没进内核"
+              exit 1
+            fi
+            echo "::notice::SUSFS 已链入内核（susfs_* 符号 ${SUSFS_SYM} 个）"
+          fi
 
           echo "==== ksu 符号抽样 ===="
           nm "$COMMON/out/vmlinux" 2>/dev/null | grep -E ' [tTdDbBrR] (ksu_|kernelsu_)' | head -15 || true
