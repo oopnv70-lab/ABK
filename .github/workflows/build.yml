@@ -329,21 +329,31 @@ jobs:
 
           cd sukisu/kernel
 
-          ARGS=(KDIR="$KDIR" CONFIG_KSU=m CC=clang)
+          # 注意：不要用 SukiSU 的 `make KDIR=...`。
+          # 它的 Makefile 做的是 `make -C $(KDIR) M=...`，要求 KDIR 目录本身
+          # 能当源码树用；而内核 5.x 起删除了 scripts/mkmakefile，`make O=`
+          # 的输出目录里不再生成 Makefile，-C 进去必然报
+          # "No rule to make target 'modules'"。
+          # 正确写法（内核文档标准形式）：-C <源码树> O=<输出目录> M=<模块>
+          KSRC="$KERNEL_PLATFORM/common"
+          MDIR="$GITHUB_WORKSPACE/sukisu/kernel"
+
+          ARGS=(O="$KDIR" M="$MDIR" src="$MDIR" CONFIG_KSU=m CC=clang)
           if [ "$ENABLE_KPM" = "true" ]; then
             ARGS+=(CONFIG_KPM=y)
           fi
-          echo "== make ${ARGS[*]} modules =="
+          echo "== make -C $KSRC ${ARGS[*]} modules =="
 
           # 第一步：只编模块。失败=编译错误（含缺失头/符号冲突）
-          if ! make "${ARGS[@]}" modules 2>&1 | tee "$LOG"; then
+          if ! make -C "$KSRC" "${ARGS[@]}" modules 2>&1 | tee "$LOG"; then
             echo "::error::kernelsu.ko 编译失败（编译阶段）"
-            grep -nE 'error:|fatal error|Error [0-9]|No such file|undefined' "$LOG" \
+            grep -nE 'error:|fatal error|Error [0-9]|No rule|No such file|undefined' "$LOG" \
               | head -10 | while IFS= read -r l; do echo "::error::${l:0:900}"; done
             exit 1
           fi
           echo "::notice::kernelsu.ko 编译通过"
 
+          cd "$MDIR"
           ls -lh kernelsu.ko || { echo "::error::没生成 kernelsu.ko"; exit 1; }
 
           mkdir -p "$GITHUB_WORKSPACE/dist"
@@ -353,12 +363,12 @@ jobs:
           # 刷进去会 Unknown symbol —— 必须当错误处理，不能静默放过。
           if [ -f "$KDIR/vmlinux" ]; then
             echo "== check_symbol =="
-            make check_symbol 2>&1 | tee -a "$LOG" || true
-            if ./check_symbol kernelsu.ko "$KDIR/vmlinux" 2>&1 | tee -a "$LOG"; then
+            clang tools/check_symbol.c -o check_symbol 2>&1 | tee -a "$LOG" || true
+            if [ -x ./check_symbol ] && ./check_symbol kernelsu.ko "$KDIR/vmlinux" 2>&1 | tee -a "$LOG"; then
               echo "::notice::check_symbol 通过"
             else
               echo "::error::check_symbol 失败：kernelsu.ko 依赖的符号与内核不匹配"
-              grep -nE 'not found|not exported|LOCAL|ERROR|error' "$LOG" \
+              grep -nE 'not found|not exported|LOCAL|ERROR|error|symbol' "$LOG" \
                 | tail -10 | while IFS= read -r l; do echo "::error::${l:0:900}"; done
               exit 1
             fi
