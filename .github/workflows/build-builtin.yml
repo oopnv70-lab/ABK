@@ -191,6 +191,10 @@ jobs:
         if: env.ENABLE_SUSFS == 'true'
         run: |
           set -uo pipefail
+          # GitHub Actions 的 run 默认是 `bash -e`。patch 只要有 hunk 失败就返回 1，
+          # -e 会让脚本当场退出，而那时 patch 输出已重定向进 $LOG，
+          # 结果是「Step 失败但日志里一行都没有」——上一轮实测就是这个症状。
+          set +e
           COMMON="$KERNEL_PLATFORM/common"
           PATCH="$GITHUB_WORKSPACE/susfs.patch"
           LOG="$GITHUB_WORKSPACE/susfs-patch.log"
@@ -212,9 +216,10 @@ jobs:
               $0==h {s=1; next}
               /^diff --git / {s=0}
               s && $0==c {f=1}
-              END {exit(f?0:1)}' "$PATCH" || return 0
-            grep -qxF "$line" "$file" && return 0
-            grep -qxF "$anchor" "$file" || return 0
+              END {exit(f?0:1)}' "$PATCH" \
+              || { echo "  skip $file：补丁没把这行当上下文"; return 0; }
+            grep -qxF "$line" "$file" && { echo "  skip $file：源文件已有该行"; return 0; }
+            grep -qxF "$anchor" "$file" || { echo "  skip $file：锚点不存在 [$anchor]"; return 0; }
             if python3 - "$file" "$line" "$anchor" <<'PY'
           import sys
           p, l, a = sys.argv[1:4]
@@ -240,8 +245,9 @@ jobs:
           echo "  共注入 ${#SHIMMED[@]} 处垫片"
 
           echo "== 步骤 2/3：应用补丁 =="
-          patch -p1 --forward --no-backup-if-mismatch < "$PATCH" > "$LOG" 2>&1
-          PRC=$?
+          # 用 tee：既要落盘又要进 job 日志，不能再把输出藏进 $LOG
+          patch -p1 --forward --no-backup-if-mismatch < "$PATCH" 2>&1 | tee "$LOG" | grep -vE '^(patching file|Hunk #[0-9]+ succeeded)'
+          PRC=${PIPESTATUS[0]}
           grep -E '^patching file' "$LOG" | wc -l | sed 's/^/  成功定位文件数: /'
           grep -E 'FAILED|Hunk #[0-9]+ (succeeded|ignored)' "$LOG" | tail -25 || true
           echo "  patch 退出码: $PRC"
