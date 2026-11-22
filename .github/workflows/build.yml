@@ -381,7 +381,8 @@ jobs:
             exit 1
           fi
 
-          ARGS=(ARCH=arm64 LLVM=1 O="$KDIR" M="$MDIR" CONFIG_KSU=m KBUILD_EXTRA_SYMBOLS="$SYM")
+          ARGS=(ARCH=arm64 LLVM=1 O="$KDIR" M="$MDIR" CONFIG_KSU=m
+            KBUILD_EXTRA_SYMBOLS="$SYM" KBUILD_MODPOST_WARN=1)
           if [ "$ENABLE_KPM" = "true" ]; then
             ARGS+=(CONFIG_KPM=y)
           fi
@@ -390,7 +391,19 @@ jobs:
           # 第一步：只编模块。失败=编译错误（含缺失头/符号冲突）
           if ! make -C "$KSRC" "${ARGS[@]}" modules 2>&1 | tee "$LOG"; then
             echo "::error::kernelsu.ko 编译失败（编译阶段）"
-            grep -nE 'error:|fatal error|Error [0-9]|No rule|No such file|undefined' "$LOG" \
+            # 注意 -i：modpost 输出是大写 ERROR:，之前写成 'error:' 一条都匹配不到，
+            # 导致 annotation 空白、只能去几千行日志里人工翻
+            {
+              echo "### ❌ kernelsu.ko 编译失败"
+              echo '```'
+              grep -inE 'error|fatal|undefined|not found|No rule' "$LOG" | head -20
+              echo '```'
+              echo "#### 日志末尾 30 行"
+              echo '```'
+              tail -30 "$LOG"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            grep -inE 'error|fatal|undefined|not found|No rule' "$LOG" \
               | head -10 | while IFS= read -r l; do echo "::error::${l:0:900}"; done
             exit 1
           fi
@@ -411,7 +424,13 @@ jobs:
               echo "::notice::check_symbol 通过"
             else
               echo "::error::check_symbol 失败：kernelsu.ko 依赖的符号与内核不匹配"
-              grep -nE 'not found|not exported|LOCAL|ERROR|error|symbol' "$LOG" \
+              {
+                echo "### ❌ check_symbol 失败"
+                echo '```'
+                tail -40 "$LOG"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              grep -inE 'not found|not exported|LOCAL|error|symbol' "$LOG" \
                 | tail -10 | while IFS= read -r l; do echo "::error::${l:0:900}"; done
               exit 1
             fi
