@@ -116,6 +116,15 @@ jobs:
           echo "$HOME/bin" >> "$GITHUB_PATH"
           ~/bin/repo --version
 
+      - name: 准备 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.DEVICE_MANIFEST }}-${{ env.BUILDER }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.DEVICE_MANIFEST }}-${{ env.BUILDER }}-
+            ccache-${{ env.DEVICE_MANIFEST }}-
+
       - name: 现场拉取一加内核源码（repo sync）
         run: |
           set -euxo pipefail
@@ -302,8 +311,11 @@ jobs:
         if: env.KSU_VARIANT != 'none'
         id: ksu
         run: |
-          set -euxo pipefail
+          # 故意不开 -e：要自己区分「编译失败」和「符号校验失败」两种，
+          # 并且把错误打进 annotation，方便远程定位（日志下载链接常被 DNS 拦）
+          set -uo pipefail
           KDIR="${{ steps.kdir.outputs.KDIR }}"
+          LOG="$GITHUB_WORKSPACE/ksu-build.log"
           cd "$GITHUB_WORKSPACE"
 
           git clone --depth=1 -b "$KSU_REF" \
@@ -313,6 +325,7 @@ jobs:
 
           CLANG_DIR=$(find "$KERNEL_PLATFORM/prebuilts/clang/host/linux-x86" -maxdepth 2 -type d -name bin | head -1)
           export PATH="$CLANG_DIR:$PATH"
+          echo "clang: $(which clang)"
 
           cd sukisu/kernel
 
@@ -320,24 +333,45 @@ jobs:
           if [ "$ENABLE_KPM" = "true" ]; then
             ARGS+=(CONFIG_KPM=y)
           fi
-          echo "make ${ARGS[*]}"
+          echo "== make ${ARGS[*]} modules =="
 
-          # 有 vmlinux 时走默认目标 all（最后一步是官方的 check_symbol 符号校验）
-          # 没 vmlinux 时退回直接编 modules，避免 check_symbol 因缺符号表误判
-          if [ -f "$KDIR/vmlinux" ]; then
-            make "${ARGS[@]}" 2>&1 | tee "$GITHUB_WORKSPACE/ksu-build.log"
-          else
-            make "${ARGS[@]}" modules 2>&1 | tee "$GITHUB_WORKSPACE/ksu-build.log"
+          # 第一步：只编模块。失败=编译错误（含缺失头/符号冲突）
+          if ! make "${ARGS[@]}" modules 2>&1 | tee "$LOG"; then
+            echo "::error::kernelsu.ko 编译失败（编译阶段）"
+            grep -nE 'error:|fatal error|Error [0-9]|No such file|undefined' "$LOG" \
+              | head -10 | while IFS= read -r l; do echo "::error::${l:0:900}"; done
+            exit 1
           fi
+          echo "::notice::kernelsu.ko 编译通过"
 
-          ls -lh kernelsu.ko
-          llvm-strip -d kernelsu.ko || strip -d kernelsu.ko || true
+          ls -lh kernelsu.ko || { echo "::error::没生成 kernelsu.ko"; exit 1; }
 
           mkdir -p "$GITHUB_WORKSPACE/dist"
           cp kernelsu.ko "$GITHUB_WORKSPACE/dist/kernelsu.ko"
 
+          # 第二步：官方符号校验。失败说明 .ko 依赖的符号在这颗内核里不可用，
+          # 刷进去会 Unknown symbol —— 必须当错误处理，不能静默放过。
+          if [ -f "$KDIR/vmlinux" ]; then
+            echo "== check_symbol =="
+            make check_symbol 2>&1 | tee -a "$LOG" || true
+            if ./check_symbol kernelsu.ko "$KDIR/vmlinux" 2>&1 | tee -a "$LOG"; then
+              echo "::notice::check_symbol 通过"
+            else
+              echo "::error::check_symbol 失败：kernelsu.ko 依赖的符号与内核不匹配"
+              grep -nE 'not found|not exported|LOCAL|ERROR|error' "$LOG" \
+                | tail -10 | while IFS= read -r l; do echo "::error::${l:0:900}"; done
+              exit 1
+            fi
+          else
+            echo "::warning::KDIR 没有 vmlinux，跳过 check_symbol（产物未做符号校验）"
+          fi
+
+          llvm-strip -d kernelsu.ko || strip -d kernelsu.ko || true
+          cp kernelsu.ko "$GITHUB_WORKSPACE/dist/kernelsu.ko"
+
           echo "--- vermagic / 版本摘要 ---"
           strings kernelsu.ko | grep -iE 'vermagic=|SukiSU|KernelSU' | head -5 || true
+          ls -lh "$GITHUB_WORKSPACE/dist/kernelsu.ko"
 
       - name: 记录构建指纹
         if: always()
@@ -394,6 +428,7 @@ jobs:
           ls -lh ./*.zip
 
       - name: 上传产物
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: PKG110-${{ env.KSU_VARIANT }}-${{ env.BUILDER }}-${{ github.run_number }}
