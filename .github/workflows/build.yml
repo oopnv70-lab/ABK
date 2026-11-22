@@ -301,8 +301,23 @@ jobs:
           fi
 
           echo "--- KDIR 关键文件 ---"
-          for f in .config vmlinux Module.symvers System.map usr/include/linux/unistd.h; do
-            printf '%-32s %s\n' "$f" "$([ -f "$KDIR/$f" ] && echo OK || echo MISSING)"
+          for f in .config vmlinux Module.symvers vmlinux.symvers modules-only.symvers System.map usr/include/linux/unistd.h; do
+            if [ -f "$KDIR/$f" ]; then
+              printf '%-32s OK  %s 行  %s\n' "$f" "$(wc -l < "$KDIR/$f" 2>/dev/null || echo -)" "$(du -h "$KDIR/$f" | cut -f1)"
+            else
+              printf '%-32s MISSING\n' "$f"
+            fi
+          done
+
+          # 关键符号是否真的导出：这几个是 SukiSU 硬依赖且标准内核必然导出的，
+          # 缺任何一个都说明符号表拿错了文件（不是一加删了导出）
+          echo "--- 抽查导出符号 ---"
+          for s in init_mm __set_fixmap kallsyms_lookup_size_offset strncpy_from_user_nofault; do
+            hit=""
+            for f in "$KDIR/vmlinux.symvers" "$KDIR/Module.symvers"; do
+              [ -f "$f" ] && grep -qE "[[:space:]]${s}[[:space:]]" "$f" && hit="$hit $(basename "$f")"
+            done
+            printf '%-32s %s\n' "$s" "${hit:-NOT FOUND}"
           done
 
           echo "KDIR=$KDIR" >> "$GITHUB_OUTPUT"
@@ -342,7 +357,31 @@ jobs:
           # SUBARCH=x86_64 推 SRCARCH=x86，include 里全是 x86 的 arch 头，
           # arm64 的 asm/compiler.h 自然找不到。
           # src= 在 6.1 无意义（6.18+ 才有），去掉避免副作用。
-          ARGS=(ARCH=arm64 LLVM=1 O="$KDIR" M="$MDIR" CONFIG_KSU=m)
+          #
+          # KBUILD_EXTRA_SYMBOLS 必须显式给，这是 6.1 scripts/Makefile.modpost 的
+          # extmod 分支决定的：
+          #   module.symvers-if-present := $(wildcard Module.symvers)   ← 相对路径
+          #   modpost-args += -e $(addprefix -i ,$(module.symvers-if-present) $(KBUILD_EXTRA_SYMBOLS))
+          # modpost 是在「模块目录」下执行的（日志里 MODPOST .../sukisu/kernel/Module.symvers
+          # 就是证据），于是 $(wildcard Module.symvers) 找的是 sukisu/kernel/Module.symvers
+          # ——一个刚 clone 的空目录，根本没有。结果内核的导出符号一个都没读进去，
+          # init_mm / __set_fixmap / strncpy_from_user_nofault 全被报 undefined。
+          # KBUILD_EXTRA_SYMBOLS 用绝对路径，不受工作目录影响，是官方正规解法。
+          SYM=""
+          for f in "$KDIR/vmlinux.symvers" "$KDIR/Module.symvers"; do
+            if [ -s "$f" ]; then
+              SYM="${SYM:+$SYM }$f"
+              echo "-- 符号表输入：$f（$(wc -l < "$f") 行）"
+            else
+              echo "-- 符号表缺失/为空：$f"
+            fi
+          done
+          if [ -z "$SYM" ]; then
+            echo "::error::\$KDIR 里既没有 vmlinux.symvers 也没有 Module.symvers，无法编外部模块"
+            exit 1
+          fi
+
+          ARGS=(ARCH=arm64 LLVM=1 O="$KDIR" M="$MDIR" CONFIG_KSU=m KBUILD_EXTRA_SYMBOLS="$SYM")
           if [ "$ENABLE_KPM" = "true" ]; then
             ARGS+=(CONFIG_KPM=y)
           fi
