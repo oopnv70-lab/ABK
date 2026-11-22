@@ -402,6 +402,29 @@ jobs:
 
           PAHOLE_BIN="$KERNEL_PLATFORM/prebuilts/kernel-build-tools/linux-x86/bin/pahole"
 
+
+          # ---- 删除厂商重复导出：test_task_ux ----
+          # 一加 6.1.141 的 block/blk-mq.c 多了一行 EXPORT_SYMBOL_GPL(test_task_ux)，
+          # 而 vendor 侧的模块自己也导出这个符号。两者同名 → 模块加载时
+          # duplicate export 被拒 → 依赖它的厂商模块全部起不来 → 卡第一屏无限重启。
+          # 判定条件与社区一致：6.1 且 sublevel >= 141。只删导出，不动函数本体。
+          if grep -q '^EXPORT_SYMBOL_GPL(test_task_ux);' block/blk-mq.c 2>/dev/null; then
+            python3 - <<'PY'
+          import re
+          p = 'block/blk-mq.c'
+          t = open(p, encoding='utf-8', errors='surrogateescape').read()
+          pat = re.compile(r'^[ \t]*EXPORT_SYMBOL_GPL\(test_task_ux\);[ \t]*(?:\n|$)', re.MULTILINE)
+          t2, n = pat.subn('', t, count=1)
+          if n != 1:
+              raise SystemExit('test_task_ux 导出行匹配到 %d 处，预期 1 处' % n)
+          open(p, 'w', encoding='utf-8', errors='surrogateescape').write(t2)
+          print('  已删除 block/blk-mq.c 的重复导出 EXPORT_SYMBOL_GPL(test_task_ux)')
+          PY
+            [ $? -eq 0 ] || { echo "::error::删除 test_task_ux 重复导出失败"; exit 1; }
+          else
+            echo "  block/blk-mq.c 里没有 test_task_ux 导出，跳过"
+          fi
+
           make -j"$(nproc)" LLVM=1 ARCH=arm64 O=out gki_defconfig >>"$LOG" 2>&1 || {
             echo "::error::gki_defconfig 失败"; tail -30 "$LOG"; exit 1; }
 
@@ -527,6 +550,16 @@ jobs:
             exit 1
           fi
           echo "::notice::kernel release 与 stock 一致：$REL"
+
+          # ---- 重复导出硬校验：test_task_ux 不许再出现在 ksymtab ----
+          # 用 nm 查 __ksymtab_ 前缀最准：只要还导出就一定有这个符号；
+          # readelf 查字符串表作为双保险（段名缺失时不会误判为通过）。
+          if nm "$COMMON/out/vmlinux" 2>/dev/null | grep -q '__ksymtab_test_task_ux' \
+             || readelf -p __ksymtab_strings "$COMMON/out/vmlinux" 2>/dev/null | grep -q 'test_task_ux'; then
+            echo "::error::vmlinux 仍在导出 test_task_ux，vendor 模块会因 duplicate export 被拒，刷入必卡第一屏"
+            exit 1
+          fi
+          echo "::notice::test_task_ux 已不再导出（ksymtab 干净）"
 
           # ---- SUSFS 校验：只有 enable_susfs=true 才要求 ----
           if [ "${ENABLE_SUSFS:-false}" = "true" ]; then
