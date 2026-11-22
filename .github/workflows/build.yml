@@ -409,6 +409,23 @@ jobs:
           fi
           echo "::notice::kernelsu.ko 编译通过"
 
+          # --- 不照搬别人的"关掉检查就完事"：把 undefined 如实统计出来 ---
+          # KBUILD_MODPOST_WARN=1 只是让 modpost 不阻断，warning 仍然会打印。
+          # 这里把「未解析符号」全部捞出来写进 Summary：
+          #   0 条 => 符号表确实读对了，.ko 与内核完全匹配
+          #   N 条 => 靠警告放行出来的，刷进去很可能 Unknown symbol，必须看到清单
+          UND=$(grep -c 'undefined!' "$LOG" 2>/dev/null || echo 0)
+          echo "- modpost 未解析符号：**${UND}** 条" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${UND:-0}" -gt 0 ]; then
+            echo "::warning::modpost 有 ${UND} 个符号未解析（WARN 模式放行），刷入前必须确认"
+            {
+              echo "#### ⚠️ 未解析符号（前 40 条）"
+              echo '```'
+              grep 'undefined!' "$LOG" | sed -E 's/^ERROR: modpost: //; s/^WARNING: modpost: //' | sort -u | head -40
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           cd "$MDIR"
           ls -lh kernelsu.ko || { echo "::error::没生成 kernelsu.ko"; exit 1; }
 
