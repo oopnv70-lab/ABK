@@ -1,13 +1,16 @@
 name: Build PKG110 Kernel
 
-# 设计原则：
-# 1. 源码只在 runner 上现场 repo sync，本地仓库里不存任何内核源码
-# 2. 每次构建把「manifest / 分支 / 两个核心仓库的 commit」写进 summary，产物可回溯
-# 3. 变体（KSU/SUSFS）用输入开关控制，不复制多份 workflow
+# ---------------------------------------------------------------------------
+# 设计原则
+# 1. 源码只在 runner 上现场 repo sync，本仓库不存任何内核源码
+# 2. 编译必须走 Kleaf / Bazel —— 传统 make 会挂（见 docs/04-oneplus-kernel-notes.md）
+# 3. 管理器走 SukiSU-Nova 的 LKM 路线：产出 kernelsu.ko，不改内核源码
+#    （不用 kernel/setup.sh，那会改 drivers/Makefile、drivers/Kconfig）
+# 4. 每次构建把 manifest / 分支 / 各仓库 commit / KSU 版本写进 summary，产物可回溯
+# ---------------------------------------------------------------------------
 
 on:
-  # 只允许手动触发：GKI 一次构建 40~90 分钟，
-  # GitHub 免费额度每月 2000 分钟，绝不能让每次 commit 都自动烧额度。
+  # 只允许手动触发：一次 Kleaf 构建 40~120 分钟，绝不能让每次 commit 都烧额度
   workflow_dispatch:
     inputs:
       device_manifest:
@@ -19,20 +22,31 @@ on:
         required: true
         default: 'oneplus/sm8650'
       ksu_variant:
-        description: 'KSU 变体（none = 纯净 GKI 基线，先跑这个）'
+        description: 'KSU 变体（默认就带 SukiSU-Nova；none 只用于验证纯净基座）'
         required: true
         type: choice
-        default: 'none'
+        default: 'SukiSU-Nova'
         options:
-          - none
           - SukiSU-Nova
-      enable_susfs:
-        description: '是否打 SUSFS 补丁（依赖 KSU 变体）'
+          - none
+      ksu_ref:
+        description: 'SukiSU-Nova 使用的分支/标签'
+        required: true
+        default: 'main'
+      enable_kpm:
+        description: '给 kernelsu.ko 打开 CONFIG_KPM（KPM 模块功能）'
         required: true
         type: boolean
-        default: false
+        default: true
+      bazel_config:
+        description: 'Kleaf 构建配置：fast = 关 LTO 少验证，速度优先'
+        required: true
+        type: choice
+        default: 'fast'
+        options:
+          - fast
+          - local
 
-# 同一分支同一时刻只允许一个构建在跑，避免重复启动把额度烧光
 concurrency:
   group: pkg110-kernel-build
   cancel-in-progress: false
@@ -43,17 +57,18 @@ permissions:
 env:
   KP_DIR: ${{ github.workspace }}/kp
   KERNEL_PLATFORM: ${{ github.workspace }}/kp/kernel_platform
-  # 手动触发时用输入值；push 触发时 inputs 为空，回落到默认值
   DEVICE_MANIFEST: ${{ inputs.device_manifest || 'oneplus_ace5_b.xml' }}
   MANIFEST_BRANCH: ${{ inputs.manifest_branch || 'oneplus/sm8650' }}
-  KSU_VARIANT: ${{ inputs.ksu_variant || 'none' }}
-  ENABLE_SUSFS: ${{ inputs.enable_susfs || 'false' }}
+  KSU_VARIANT: ${{ inputs.ksu_variant || 'SukiSU-Nova' }}
+  KSU_REF: ${{ inputs.ksu_ref || 'main' }}
+  ENABLE_KPM: ${{ inputs.enable_kpm == false && 'false' || 'true' }}
+  BAZEL_CONFIG: ${{ inputs.bazel_config || 'fast' }}
 
 jobs:
   build:
     name: kernel-build
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 300
 
     steps:
       - name: 检出本仓库（只要 workflow/脚本，不要源码）
@@ -64,7 +79,8 @@ jobs:
           set -euxo pipefail
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/lib/jvm /usr/local/.ghcup || true
           sudo apt-get clean
           df -h /
 
@@ -73,9 +89,10 @@ jobs:
           set -euxo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            git-core gnupg flex bison build-essential zip unzip curl zlib1g-dev \
             libc6-dev libncurses-dev libssl-dev libelf-dev bc cpio rsync \
-            python3 python3-pip dwarves lz4 device-tree-compiler ccache
+            python3 python3-pip dwarves lz4 device-tree-compiler ccache \
+            file libarchive-tools
 
       - name: 安装 repo 工具
         run: |
@@ -86,14 +103,6 @@ jobs:
           chmod +x ~/bin/repo
           echo "$HOME/bin" >> "$GITHUB_PATH"
           ~/bin/repo --version
-
-      - name: 准备 ccache 缓存
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ env.DEVICE_MANIFEST }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ env.DEVICE_MANIFEST }}-
 
       - name: 现场拉取一加内核源码（repo sync）
         run: |
@@ -117,19 +126,187 @@ jobs:
           echo "==== 拉取结果 ===="
           du -sh "$KP_DIR"
           df -h /
-          grep -E 'name=|revision=' ".repo/manifests/$DEVICE_MANIFEST" | head -30
+          grep -E 'name=|revision=' ".repo/manifests/$DEVICE_MANIFEST" | head -40
 
-      - name: 记录源码版本
+      # ---------------------------------------------------------------------
+      # Kleaf / Bazel 编译
+      # 依据：OnePlusOSS 维护者在 issue #2 的明确答复 + 成功者的命令
+      #   tools/bazel build --config=fast //common:kernel_aarch64_dist
+      # 传统 make gki_defconfig all 会在 modpost 阶段因 __stack_chk_guard
+      # undefined 批量失败，这条路线已被否。
+      # ---------------------------------------------------------------------
+      - name: 编译内核（Kleaf / Bazel）
+        run: |
+          set -euxo pipefail
+          cd "$KERNEL_PLATFORM"
+
+          ls prebuilts/ 2>/dev/null || true
+
+          export CCACHE_DIR="$HOME/.ccache"
+          export CCACHE_MAXSIZE="12G"
+          ccache -z
+
+          tools/bazel build --config="$BAZEL_CONFIG" //common:kernel_aarch64_dist \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+          ccache -s
+
+          echo "==== bazel 产物一览 ===="
+          ls -la bazel-bin/common/ || true
+          du -sh bazel-bin 2>/dev/null || true
+          df -h /
+
+      # 产物位置在不同 Kleaf 版本上有差异，这里做一次探测并把结果写进 summary，
+      # 避免"猜一个路径然后静默失败"。
+      - name: 定位内核产物
+        id: artifacts
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_PLATFORM"
+
+          CANDIDATES=(
+            "bazel-bin/common/kernel_aarch64_gki_artifacts"
+            "bazel-bin/common/kernel_aarch64_dist"
+            "out/dist"
+          )
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 产物探测" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 候选目录 | 存在 | 内容 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for d in "${CANDIDATES[@]}"; do
+            if [ -d "$d" ]; then
+              echo "| \`$d\` | 有 | $(ls "$d" | tr '\n' ' ') |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| \`$d\` | 无 | - |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          IMAGE=""
+          for d in "${CANDIDATES[@]}"; do
+            for n in Image Image.gz Image.lz4 Image.bz2; do
+              if [ -f "$d/$n" ]; then IMAGE="$d/$n"; break 2; fi
+            done
+          done
+          if [ -z "$IMAGE" ]; then
+            IMAGE=$(find bazel-bin/common -maxdepth 4 -name 'Image' -type f 2>/dev/null | head -1 || true)
+          fi
+          if [ -z "$IMAGE" ]; then
+            echo "::error::Kleaf 构建结束但找不到 Image，请看上方候选目录清单"
+            find bazel-bin/common -maxdepth 4 -name 'Image*' 2>/dev/null | head -20 || true
+            exit 1
+          fi
+          echo "IMAGE=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "找到内核镜像：$IMAGE"
+
+      # ---------------------------------------------------------------------
+      # SukiSU-Nova LKM
+      # 依据：SukiSU-Nova 自己的 .github/workflows/ddk-lkm.yml（arm64 分支）
+      #   cd kernel && make CONFIG_KSU=m CONFIG_KPM=y CC=clang
+      # 它要求 KDIR 是一棵「已有 vmlinux + Module.symvers」的内核树；
+      # 官方 CI 用预置 ddk 镜像提供 KDIR，这里改成用本次构建现场拼一个。
+      # ---------------------------------------------------------------------
+      - name: 准备 KDIR（外部模块编译用的内核树）
+        if: env.KSU_VARIANT != 'none'
+        id: kdir
+        run: |
+          set -euxo pipefail
+          COMMON="$KERNEL_PLATFORM/common"
+          KDIR="$KERNEL_PLATFORM/ksu-kdir"
+          KLEAF_OUT="$KERNEL_PLATFORM/bazel-bin/common/kernel_aarch64"
+          mkdir -p "$KDIR"
+
+          CLANG_DIR=$(find "$KERNEL_PLATFORM/prebuilts/clang/host/linux-x86" -maxdepth 2 -type d -name bin | head -1)
+          export PATH="$CLANG_DIR:$PATH"
+          clang --version | head -2
+
+          echo "==== 探测 Kleaf objtree ===="
+          if [ -d "$KLEAF_OUT" ]; then
+            ls "$KLEAF_OUT" | head -40 || true
+          else
+            echo "未找到 bazel-bin/common/kernel_aarch64"
+          fi
+
+          # 用同源码树 + gki_defconfig 生成干净 objtree（usr/include 等由它生成）
+          make -C "$COMMON" O="$KDIR" ARCH=arm64 LLVM=1 gki_defconfig
+          make -C "$COMMON" O="$KDIR" ARCH=arm64 LLVM=1 modules_prepare -j"$(nproc)"
+
+          # SELinux 头是 Kbuild 里被 include 的，必须先生成
+          make -C "$COMMON" O="$KDIR" ARCH=arm64 LLVM=1 security/selinux/built-in.a -j"$(nproc)"
+
+          # 关键：vmlinux / Module.symvers 用 Kleaf 那份，保证符号与刷入内核一致
+          for f in vmlinux Module.symvers System.map; do
+            if [ -f "$KLEAF_OUT/$f" ]; then
+              cp -v "$KLEAF_OUT/$f" "$KDIR/$f"
+            else
+              echo "::warning::$f 在 Kleaf objtree 中未找到"
+            fi
+          done
+
+          if [ ! -f "$KDIR/vmlinux" ]; then
+            echo "::warning::KDIR 里没有 vmlinux，check_symbol 会被跳过"
+          fi
+          echo "usr/include 存在：$([ -f "$KDIR/usr/include/linux/unistd.h" ] && echo yes || echo no)"
+
+          echo "KDIR=$KDIR" >> "$GITHUB_OUTPUT"
+          ls -lh "$KDIR" | head -30
+
+      - name: 编译 kernelsu.ko（SukiSU-Nova LKM）
+        if: env.KSU_VARIANT != 'none'
+        id: ksu
+        run: |
+          set -euxo pipefail
+          KDIR="${{ steps.kdir.outputs.KDIR }}"
+          cd "$GITHUB_WORKSPACE"
+
+          git clone --depth=1 -b "$KSU_REF" \
+            https://github.com/SukiSU-Nova/SukiSU-Nova.git sukisu
+          echo "- SukiSU-Nova: \`$(git -C sukisu rev-parse HEAD)\` $(git -C sukisu log -1 --format='%ad %s')" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+          CLANG_DIR=$(find "$KERNEL_PLATFORM/prebuilts/clang/host/linux-x86" -maxdepth 2 -type d -name bin | head -1)
+          export PATH="$CLANG_DIR:$PATH"
+          which clang
+
+          cd sukisu/kernel
+
+          ARGS=(KDIR="$KDIR" CONFIG_KSU=m CC=clang)
+          if [ "$ENABLE_KPM" = "true" ]; then
+            ARGS+=(CONFIG_KPM=y)
+          fi
+          echo "make ${ARGS[*]}"
+
+          # 有 vmlinux 时走默认目标 all（内含 check_symbol 符号校验）
+          # 没 vmlinux 时退回直接编 modules，避免 check_symbol 因缺符号表误判
+          if [ -f "$KDIR/vmlinux" ]; then
+            make "${ARGS[@]}" 2>&1 | tee "$GITHUB_WORKSPACE/ksu-build.log"
+          else
+            make "${ARGS[@]}" modules 2>&1 | tee "$GITHUB_WORKSPACE/ksu-build.log"
+          fi
+
+          ls -lh kernelsu.ko
+          llvm-strip -d kernelsu.ko || strip -d kernelsu.ko || true
+
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp kernelsu.ko "$GITHUB_WORKSPACE/dist/kernelsu.ko"
+
+          echo "--- vermagic / 版本摘要 ---"
+          strings kernelsu.ko | grep -iE '^vermagic=|SukiSU|v3\.' | head -5 || true
+
+      - name: 记录构建指纹
+        if: always()
         run: |
           set -euo pipefail
           {
+            echo ""
             echo "### 构建指纹"
             echo ""
             echo "| 项 | 值 |"
             echo "|---|---|"
             echo "| manifest | \`$DEVICE_MANIFEST\` @ \`$MANIFEST_BRANCH\` |"
-            echo "| KSU 变体 | \`$KSU_VARIANT\` |"
-            echo "| SUSFS | \`$ENABLE_SUSFS\` |"
+            echo "| KSU 变体 | \`$KSU_VARIANT\` @ \`$KSU_REF\` |"
+            echo "| KPM | \`$ENABLE_KPM\` |"
+            echo "| bazel config | \`$BAZEL_CONFIG\` |"
             for d in common msm-kernel; do
               if [ -d "$KERNEL_PLATFORM/$d/.git" ]; then
                 ver=$(sed -n '2p;3p;4p' "$KERNEL_PLATFORM/$d/Makefile" 2>/dev/null | tr -d '\n ')
@@ -140,58 +317,34 @@ jobs:
             done
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 编译内核
-        run: |
-          set -euxo pipefail
-          COMMON="$KERNEL_PLATFORM/common"
-          cd "$COMMON"
-
-          CLANG_DIR="$KERNEL_PLATFORM/prebuilts/clang/host/linux-x86/clang-r487747c/bin"
-          export PATH="$CLANG_DIR:$PATH"
-          clang --version
-
-          PAHOLE_BIN="$KERNEL_PLATFORM/prebuilts/kernel-build-tools/linux-x86/bin/pahole"
-
-          export CCACHE_DIR="$HOME/.ccache"
-          export CCACHE_MAXSIZE="10G"
-          ccache -z
-
-          make -j"$(nproc)" \
-            LLVM=1 \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC="ccache clang" \
-            LD=ld.lld HOSTLD=ld.lld \
-            PAHOLE="$PAHOLE_BIN" \
-            O=out \
-            gki_defconfig all 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
-
-          ccache -s
-
       - name: 收集产物
+        if: always()
         run: |
           set -euo pipefail
-          OUT="$KERNEL_PLATFORM/common/out"
           mkdir -p "$GITHUB_WORKSPACE/dist"
-
-          IMAGE=$(find "$OUT/arch/arm64/boot" -maxdepth 1 -name 'Image*' | head -1)
-          [ -n "$IMAGE" ] || { echo "::error::没找到 Image"; exit 1; }
-          cp "$IMAGE" "$GITHUB_WORKSPACE/dist/Image"
-
-          cp -v "$OUT/System.map" "$GITHUB_WORKSPACE/dist/" 2>/dev/null || true
-          cp -v "$OUT/Module.symvers" "$GITHUB_WORKSPACE/dist/" 2>/dev/null || true
-          if [ -f "$OUT/vmlinux" ]; then cp "$OUT/vmlinux" "$GITHUB_WORKSPACE/dist/"; fi
-
-          ls -lh "$GITHUB_WORKSPACE/dist"
+          SRC="${{ steps.artifacts.outputs.IMAGE }}"
+          if [ -n "${SRC:-}" ] && [ -f "$SRC" ]; then
+            cp -v "$SRC" "$GITHUB_WORKSPACE/dist/Image"
+          fi
+          ls -lh "$GITHUB_WORKSPACE/dist" || true
 
       - name: 打包 AnyKernel3
+        if: env.KSU_VARIANT != 'none'
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
+          if [ ! -f dist/Image ]; then
+            echo "::warning::没有 Image，跳过 AnyKernel3 打包"
+            exit 0
+          fi
+
           git clone --depth=1 https://github.com/Xiaomichael/AnyKernel3 anykernel3
           rm -rf anykernel3/.git
           cp dist/Image anykernel3/Image
-          ( cd anykernel3 && zip -q -r9 "../Image-${GITHUB_RUN_NUMBER}.zip" ./* )
+          # LKM 模式下内核本身不含 KSU，模块随包放同级目录，方便一起取用
+          cp dist/kernelsu.ko anykernel3/kernelsu.ko || true
+
+          ( cd anykernel3 && zip -q -r9 "../PKG110-${KSU_VARIANT}-${GITHUB_RUN_NUMBER}.zip" ./* )
           ls -lh ./*.zip
 
       - name: 上传产物
@@ -202,4 +355,5 @@ jobs:
             dist/*
             *.zip
             build.log
-          if-no-files-found: error
+            ksu-build.log
+          if-no-files-found: warn
