@@ -1180,6 +1180,8 @@ jobs:
           cat > anykernel.sh <<'AK3'
           ### AnyKernel3 Ramdisk Mod Script
           ### PKG110 (OnePlus Ace5) - 自编译 GKI + 内置 SukiSU-Nova
+          ### 本机实测前提：recovery 是独立分区；boot.img 为 header v4 且无 ramdisk（ramdisk 在 init_boot）。
+          ### 因此这里只做「拆 boot → 换内核 → 回写」，不碰 ramdisk、不碰 recovery。
           properties() { '
           kernel.string=PKG110 builtin KSU (self-built GKI)
           do.devicecheck=1
@@ -1196,18 +1198,80 @@ jobs:
           supported.patchlevels=
           supported.vendorpatchlevels=
           '; } # end properties
-
-          # A/B 设备，boot 分区按 slot 自动选
-          BLOCK=boot;
+          
+          # 只写活动槽：ak3-core.sh 的 setup_ak 里有「/postinstall/tmp 是目录且未指定 SLOT_SELECT 时
+          # 自动翻成 inactive」的分支，OTA 暂存目录一出现就会把内核写进另一槽（刷成功但开机还是旧内核）。
+          # 显式固定 active 直接短路该分支。
+          SLOT_SELECT=active;
+          
+          # 直接给绝对节点：一次跳过 plistboot / plistreco / /proc/mtd / platform 通配等历史启发式，
+          # 只按活动槽拼 boot$SLOT（ak3-core.sh 会给 /dev/* 路径追加 $SLOT 后缀）。
+          BLOCK=/dev/block/by-name/boot;
           IS_SLOT_DEVICE=1;
           RAMDISK_COMPRESSION=auto;
-          PATCH_VBMETA_FLAG=auto;
-
+          # boot.img 无 ramdisk、包内也不带 avb 工具：vbmeta 标记不做任何改写，显式关掉，
+          # 不依赖 auto 的运行时判定。
+          PATCH_VBMETA_FLAG=0;
           . tools/ak3-core.sh;
-
-          # Android 13+ / GKI 2.0：ramdisk 在 init_boot，boot.img 只有 kernel
+          
+          # ---- 写入前三道自检（setup_ak 在 source 时就执行完，此时 $BLOCK 已是解析后的绝对节点）----
+          case "$SLOT" in
+            _a|_b) : ;;
+            *) abort "活动槽异常（SLOT='$SLOT'），拒绝刷写。";;
+          esac
+          DEVCHK=$(getprop ro.product.device)
+          [ "$DEVCHK" = "PKG110" ] || abort "设备不符：ro.product.device='$DEVCHK'，本包仅支持 PKG110。"
+          [ -b "$BLOCK" ] || abort "目标不是块设备：$BLOCK"
+          ui_print "  活动槽：$SLOT"
+          ui_print "  目标分区：$BLOCK"
+          
           split_boot;
           flash_boot;
+          
+          # ---- 写后回读自证：把目标分区的 kernel 段读回来，与包内 Image 比 md5 ----
+          # header v3/v4 没有 page_size 字段，kernel 固定从 4096 开始；v0-2 才读 @36 的 page_size。
+          verify_kernel_write() {
+            if ! command -v od >/dev/null 2>&1 || ! command -v md5sum >/dev/null 2>&1; then
+              ui_print "  （环境缺 od/md5sum，回读校验跳过）"
+              return 0
+            fi
+            # 先验 boot 头 magic，避免把别的数据当成 header 解析
+            MAGIC=$(dd if="$BLOCK" bs=1 count=8 2>/dev/null)
+            if [ "$MAGIC" != "ANDROID!" ]; then
+              ui_print "  （头部非 ANDROID!，不是 boot 镜像，回读校验跳过）"
+              return 0
+            fi
+            HV=$(od -An -tu4 -j 40 -N 4 "$BLOCK" 2>/dev/null | tr -d ' \n')
+            KS=$(od -An -tu4 -j 8  -N 4 "$BLOCK" 2>/dev/null | tr -d ' \n')
+            case "$KS" in
+              ''|*[!0-9]*) ui_print "  （读不到 kernel_size，回读校验跳过）"; return 0;;
+            esac
+            if [ "$KS" -gt 268435456 ]; then
+              ui_print "  （kernel_size=$KS 不合理，回读校验跳过）"
+              return 0
+            fi
+            KOF=4096
+            case "$HV" in
+              ''|*[!0-9]*) : ;;
+              *) [ "$HV" -lt 3 ] && KOF=$(od -An -tu4 -j 36 -N 4 "$BLOCK" 2>/dev/null | tr -d ' \n');;
+            esac
+            case "$KOF" in ''|0|*[!0-9]*) KOF=4096;; esac
+            SZ=$(wc -c < Image | tr -d ' ')
+            [ "$SZ" = "$KS" ] || ui_print "  ⚠ 分区内 kernel 段 $KS 字节，包内 Image $SZ 字节（大小不一致）"
+            CNT=$(( (KS + KOF - 1) / KOF ))
+            GOT=$(dd if="$BLOCK" bs=$KOF skip=1 count=$CNT 2>/dev/null | head -c "$KS" | md5sum | cut -d' ' -f1)
+            WANT=$(md5sum Image | cut -d' ' -f1)
+            if [ "$GOT" = "$WANT" ]; then
+              ui_print "  ✅ 回读校验通过：$BLOCK kernel 段 $KS 字节，md5 与包内 Image 一致"
+              ui_print "     md5=$WANT"
+            else
+              ui_print "  ❌ 回读校验不一致：expect=$WANT got=$GOT"
+              ui_print "     请勿依赖本次启动；回退用 fastboot flash boot$SLOT <原厂 boot.img>"
+              ( echo "AK3 verify failed: blk=$BLOCK hdr_v=$HV ks=$KS kof=$KOF want=$WANT got=$GOT" \
+                > /data/local/tmp/ak3-verify-fail.log ) 2>/dev/null || true
+            fi
+          }
+          verify_kernel_write;
           AK3
 
           cp "$GITHUB_WORKSPACE/dist/Image" ./Image
@@ -1215,6 +1279,14 @@ jobs:
 
           echo "=== 包内容 ==="
           ls -l anykernel.sh Image
+          # 生成的刷写脚本必须自洽：语法过关 + 四道约束在位，缺一项就红
+          bash -n anykernel.sh || { echo "::error::anykernel.sh 语法错误"; exit 1; }
+          for chk in 'SLOT_SELECT=active;' 'BLOCK=/dev/block/by-name/boot;' 'IS_SLOT_DEVICE=1;' 'PATCH_VBMETA_FLAG=0;' 'verify_kernel_write;'; do
+            grep -qF "$chk" anykernel.sh || { echo "::error::anykernel.sh 缺约束：$chk"; exit 1; }
+          done
+          grep -qF 'split_boot;' anykernel.sh && grep -qF 'flash_boot;' anykernel.sh \
+            || { echo "::error::anykernel.sh 缺 split_boot/flash_boot"; exit 1; }
+          echo "::notice::anykernel.sh 校验通过（语法 OK / 4 条约束在位 / split+flash 在位）"
           ls -l tools/ | head
 
           # 许可声明与源码指引随包分发：别人只拿到这个 zip 时，也必须能查到
@@ -1244,7 +1316,7 @@ jobs:
             echo "|---|---|"
             echo "| 包 | \`$(basename "$ZIP")\` |"
             echo "| 大小 | $(du -h "$ZIP" | cut -f1) |"
-            echo "| 刷写方式 | AnyKernel3（split_boot/flash_boot，不改 ramdisk） |"
+            echo "| 刷写方式 | AnyKernel3（split_boot/flash_boot，不改 ramdisk，只写活动槽 boot，刷后回读比对 md5） |"
             echo "| 设备校验 | PKG110 / oneplus_ace5 |"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::AnyKernel3 打包完成：$(basename "$ZIP")"

@@ -31,10 +31,18 @@ Release 附件就是可刷入的 AnyKernel3 包本体：**不需要解压，也�
 - 要用 `.kpm` 模块，选 **v1.1**
 
 ## 刷入
-
-1. 只用 **SukiSU Nova 管理器** 刷入本 zip（AnyKernel3，自动选 slot，不改 ramdisk）
+1. 只用 **SukiSU Nova 管理器** 刷入本 zip（AnyKernel3，不改 ramdisk，只写活动槽的 `boot`）
 2. **TWRP 不可用**（本机实测），不要尝试
 3. 刷前备份一份 boot；异常时回刷 v1.0 或原厂 boot
+
+刷写脚本做了四道约束，都在 `anykernel.sh` 配置层（未改 AnyKernel3 本体）：
+
+| 约束 | 作用 |
+| --- | --- |
+| `SLOT_SELECT=active` | 杜绝「刷成功但开机还是旧内核」：AK3 在 `/postinstall/tmp` 存在时会自动把槽翻成 `inactive`（OTA 暂存目录一出现就中招），显式固定为活动槽 |
+| `BLOCK=/dev/block/by-name/boot` | 直接给绝对节点，跳过 `plistboot`/`plistreco`/`/proc/mtd`/`platform` 通配等历史启发式（含 recovery-in-boot 机型的分支，本机无关） |
+| `PATCH_VBMETA_FLAG=0` | boot.img 无 ramdisk、包内不带 avb 工具，vbmeta 标记不做任何改写，不依赖 `auto` 的运行时判定 |
+| 写入前自检 + 写入后回读 | 前：槽必须 `_a`/`_b`、`ro.product.device` 必须 `PKG110`、目标必须是块设备；后：把目标分区 kernel 段读回来与包内 `Image` 比 md5，不一致会打印 `❌` 并落 `/data/local/tmp/ak3-verify-fail.log` |
 
 ## 风险
 
