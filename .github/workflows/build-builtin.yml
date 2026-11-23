@@ -47,6 +47,11 @@ on:
         required: true
         type: boolean
         default: true
+      enable_kpm:
+        description: '打开 CONFIG_KPM（SukiSU KPM 运行时模块加载；会 select KALLSYMS_ALL）'
+        required: true
+        type: boolean
+        default: false
       stock_localversion:
         description: 'stock 内核 release 的后缀，必须与设备原厂 uname -r 的后半截逐字一致'
         required: false
@@ -66,6 +71,7 @@ env:
   MANIFEST_BRANCH: ${{ inputs.manifest_branch || 'oneplus/sm8650' }}
   KSU_REF: ${{ inputs.ksu_ref || 'builtin' }}
   ENABLE_SUSFS: ${{ inputs.enable_susfs == true && 'true' || 'false' }}
+  ENABLE_KPM: ${{ inputs.enable_kpm == true && 'true' || 'false' }}
   # stock 内核 release 的后半截（KERNELVERSION=6.1.141 之外的部分）。
   # 必须与设备原厂内核逐字一致：内核 check_modinfo() 拿它做 vermagic 比对，
   # 不匹配则 vendor_dlkm 里所有 .ko 拒绝加载 → 卡第一屏无限重启（无 panic）。
@@ -442,15 +448,26 @@ jobs:
           make -j"$(nproc)" LLVM=1 ARCH=arm64 O=out gki_defconfig >>"$LOG" 2>&1 || {
             echo "::error::gki_defconfig 失败"; tail -30 "$LOG"; exit 1; }
 
-          # 显式开 KSU；SUSFS 按开关处理（默认关，理由见文件头注释）
-          # 不加 KALLSYMS_ALL：那是把 static/局部符号也塞进 kallsyms，
-          # 会让内核凭空多出一整张完整符号表，官方 gki_defconfig 本来就不开，
-          # 内置 KSU 也不需要它。
+          # 显式开 KSU；SUSFS / KPM 按各自开关处理。
+          # 关于 CONFIG_KALLSYMS_ALL（订正 2026-11 的旧判断）：
+          #   旧注释写「不加 KALLSYMS_ALL，官方 gki_defconfig 本来就不开」——那句仍然正确，
+          #   gki_defconfig 确实不开它。但现在有了明确依据：
+          #   Nova 的 kernel/Kconfig 里 config KPM 自带
+          #       select KALLSYMS / select KALLSYMS_ALL
+          #   即「开 KPM 就一定会有 KALLSYMS_ALL」，这是上游强制的，不是我额外加的。
+          #   另实测本机可用内核（stock）的 /proc/config.gz 本来就 CONFIG_KALLSYMS_ALL=y，
+          #   所以开 KPM 后这部分与 stock 同侧，不是新增未知项。
+          #   代价：kallsyms 表包含数据符号，Image 会变大（预期，不视为失败）。
           scripts/config --file out/.config -e KSU
           if [ "$ENABLE_SUSFS" = "true" ]; then
             scripts/config --file out/.config -e KSU_SUSFS
           else
             scripts/config --file out/.config -d KSU_SUSFS
+          fi
+          if [ "$ENABLE_KPM" = "true" ]; then
+            scripts/config --file out/.config -e KPM
+          else
+            scripts/config --file out/.config -d KPM
           fi
 
           # ---- 让 kernel release 精确等于 stock，否则 vendor 模块全部拒绝加载 ----
@@ -487,7 +504,7 @@ jobs:
 
           echo "==== 关键配置确认 ===="
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E '^CONFIG_(KSU|KSU_SUSFS|KALLSYMS|LOCALVERSION)' out/.config | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E '^CONFIG_(KSU|KSU_SUSFS|KPM|KALLSYMS|LOCALVERSION)' out/.config | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           if ! grep -q '^CONFIG_KSU=y' out/.config; then
             echo "::error::CONFIG_KSU 不是 y，KSU 不会被编进内核"
@@ -625,6 +642,51 @@ jobs:
             echo "::notice::SUSFS 已链入内核（susfs_* 符号 ${SUSFS_SYM} 个）"
           fi
 
+          # ---- KPM 校验：只有 enable_kpm=true 才要求 ----
+          # 判据选择（重要，别搞错）：
+          #   kernel/extension/kpm.c 是 glue，**无条件**编进 kernelsu-objs，
+          #   所以 sukisu_kpm_bridge 在 CONFIG_KPM=n 时也存在 → 不能拿它当开关判据。
+          #   CONFIG_KPM=y 时才编的是 extension/kpm/{kpm,compact,super_access}.o，
+          #   可靠判据是：obj 文件存在 + compact.c 导出的 sukisu_compact_find_symbol。
+          if [ "${ENABLE_KPM:-false}" = "true" ]; then
+            KPM_OBJ="$COMMON/out/drivers/kernelsu/extension/kpm/kpm.o"
+            KPM_COMPACT="$COMMON/out/drivers/kernelsu/extension/kpm/compact.o"
+            KPM_SYM=$(nm "$COMMON/out/vmlinux" 2>/dev/null | grep -c 'sukisu_compact_find_symbol' || true)
+            KPM_CFG=$(grep -E '^CONFIG_(KPM|KALLSYMS)=|^CONFIG_KALLSYMS_ALL=' "$COMMON/out/.config" | tr '\n' ' ')
+            {
+              echo "| out/.../extension/kpm/kpm.o | $([ -f "$KPM_OBJ" ] && du -h "$KPM_OBJ" | cut -f1 || echo 缺失) |"
+              echo "| out/.../extension/kpm/compact.o | $([ -f "$KPM_COMPACT" ] && du -h "$KPM_COMPACT" | cut -f1 || echo 缺失) |"
+              echo "| vmlinux 中 sukisu_compact_find_symbol | ${KPM_SYM} 个 |"
+              echo "| KPM 相关 config | \`${KPM_CFG}\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            # 1) config 三件套：KPM=y，以及被 KPM select 的 KALLSYMS / KALLSYMS_ALL 必须真的生效
+            grep -q '^CONFIG_KPM=y' "$COMMON/out/.config" \
+              || { echo "::error::ENABLE_KPM=true 但 CONFIG_KPM 不是 y"; exit 1; }
+            grep -q '^CONFIG_KALLSYMS=y' "$COMMON/out/.config" \
+              || { echo "::error::CONFIG_KALLSYMS 不是 y，KPM 无法解析符号"; exit 1; }
+            grep -q '^CONFIG_KALLSYMS_ALL=y' "$COMMON/out/.config" \
+              || { echo "::error::CONFIG_KALLSYMS_ALL 没被 KPM select 上，KPM 查不到数据符号"; exit 1; }
+            # 2) 编译日志必须有 Kbuild 的 $(info -- KPM is enabled)
+            grep -q 'KPM is enabled' "$GITHUB_WORKSPACE/build-builtin.log" \
+              || { echo "::error::编译日志没有 'KPM is enabled'，KPM 没被编进来"; exit 1; }
+            # 3) 目标文件与符号（防「config 开了但没编」）
+            [ -f "$KPM_OBJ" ] || { echo "::error::缺少 out/.../extension/kpm/kpm.o"; exit 1; }
+            [ -f "$KPM_COMPACT" ] || { echo "::error::缺少 out/.../extension/kpm/compact.o"; exit 1; }
+            if [ "${KPM_SYM:-0}" -eq 0 ]; then
+              echo "::error::vmlinux 里没有 sukisu_compact_find_symbol，KPM 没链进内核"
+              exit 1
+            fi
+            echo "::notice::KPM 已链入内核（sukisu_compact_find_symbol ${KPM_SYM} 个 / ${KPM_CFG}）"
+          else
+            # 关掉时必须确认真的关掉，否则开关等于失效
+            if grep -q '^CONFIG_KPM=y' "$COMMON/out/.config"; then
+              echo "::error::ENABLE_KPM=false 但 CONFIG_KPM=y，开关失效"
+              exit 1
+            fi
+            echo "::notice::KPM 未启用（ENABLE_KPM=false），KPM 相关代码不参与编译"
+          fi
+
           echo "==== ksu 符号抽样 ===="
           nm "$COMMON/out/vmlinux" 2>/dev/null | grep -E ' [tTdDbBrR] (ksu_|kernelsu_)' | head -15 || true
           echo "==== 版本串 ===="
@@ -713,7 +775,9 @@ jobs:
           ls -l anykernel.sh Image
           ls -l tools/ | head
 
-          ZIP="$GITHUB_WORKSPACE/dist/PKG110-$KSU_REF-AnyKernel3-$GITHUB_RUN_NUMBER.zip"
+          KPM_TAG=""
+          if [ "$ENABLE_KPM" = "true" ]; then KPM_TAG="-kpm"; fi
+          ZIP="$GITHUB_WORKSPACE/dist/PKG110-$KSU_REF${KPM_TAG}-AnyKernel3-$GITHUB_RUN_NUMBER.zip"
           rm -f "$ZIP"
           zip -r9 "$ZIP" . -x '*.git*' >/dev/null || { echo "::error::zip 失败"; exit 1; }
           ls -lh "$ZIP"
