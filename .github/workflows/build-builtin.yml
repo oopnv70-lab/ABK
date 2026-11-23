@@ -642,49 +642,51 @@ jobs:
             echo "::notice::SUSFS 已链入内核（susfs_* 符号 ${SUSFS_SYM} 个）"
           fi
 
-          # ---- KPM 校验：只有 enable_kpm=true 才要求 ----
-          # 判据选择（重要，别搞错）：
-          #   kernel/extension/kpm.c 是 glue，**无条件**编进 kernelsu-objs，
-          #   所以 sukisu_kpm_bridge 在 CONFIG_KPM=n 时也存在 → 不能拿它当开关判据。
-          #   CONFIG_KPM=y 时才编的是 extension/kpm/{kpm,compact,super_access}.o，
-          #   可靠判据是：obj 文件存在 + compact.c 导出的 sukisu_compact_find_symbol。
-          if [ "${ENABLE_KPM:-false}" = "true" ]; then
-            KPM_OBJ="$COMMON/out/drivers/kernelsu/extension/kpm/kpm.o"
-            KPM_COMPACT="$COMMON/out/drivers/kernelsu/extension/kpm/compact.o"
-            KPM_SYM=$(nm "$COMMON/out/vmlinux" 2>/dev/null | grep -c 'sukisu_compact_find_symbol' || true)
-            KPM_CFG=$(grep -E '^CONFIG_(KPM|KALLSYMS)=|^CONFIG_KALLSYMS_ALL=' "$COMMON/out/.config" | tr '\n' ' ')
-            {
-              echo "| out/.../extension/kpm/kpm.o | $([ -f "$KPM_OBJ" ] && du -h "$KPM_OBJ" | cut -f1 || echo 缺失) |"
-              echo "| out/.../extension/kpm/compact.o | $([ -f "$KPM_COMPACT" ] && du -h "$KPM_COMPACT" | cut -f1 || echo 缺失) |"
-              echo "| vmlinux 中 sukisu_compact_find_symbol | ${KPM_SYM} 个 |"
-              echo "| KPM 相关 config | \`${KPM_CFG}\` |"
-            } >> "$GITHUB_STEP_SUMMARY"
+          # ---- KPM 校验：按 ENABLE_KPM 双向硬校验 ----
+          # 机制说明（踩坑换来的，别再按 main 分支的 Kbuild 去想象 builtin）：
+          #   builtin 分支是 unity build：kernel/ksu_main.c 直接
+          #     #include "extension/kpm.c"
+          #     #include "extension/kpm/kpm.c" / compact.c / super_access.c
+          #   kernel/Makefile 里只有 `obj-$(CONFIG_KSU) := ksu.o` 与 `ksu-y := ksu_main.o`，
+          #   ⇒ **根本不存在 extension/kpm/*.o**。
+          #   上一版 CI 拿 obj 存在性当判据，导致 run 45088610906 在编译全成功后被误判失败。
+          #   另：KSU_CAN_USE_KPM 是按 LINUX_VERSION_CODE>=4.4 定义的，与 CONFIG_KPM 无关，
+          #   所以 sukisu_compact_find_symbol 在开关两边都存在，同样不能当判据。
+          # 可靠判据：kernel/extension/kpm.c 里 #ifdef CONFIG_KPM 的一对互斥字符串
+          #   CONFIG_KPM=y : "forced VERSION probe, KPM is built in"
+          #   CONFIG_KPM=n : "forced VERSION probe, KPM is *not* built in"
+          VMLINUX="$COMMON/out/vmlinux"
+          KPM_ON=$(strings "$VMLINUX" | grep -cF 'forced VERSION probe, KPM is built in' || true)
+          KPM_OFF=$(strings "$VMLINUX" | grep -cF 'forced VERSION probe, KPM is *not* built in' || true)
+          KPM_CFG=$(grep -E '^CONFIG_KPM=|^CONFIG_KALLSYMS=|^CONFIG_KALLSYMS_ALL=' "$COMMON/out/.config" | tr '\n' ' ')
+          {
+            echo "| KPM 相关 config | \`${KPM_CFG}\` |"
+            echo "| vmlinux 中 'KPM is built in' 串 | ${KPM_ON} |"
+            echo "| vmlinux 中 'KPM is *not* built in' 串 | ${KPM_OFF} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
+          if [ "${ENABLE_KPM:-false}" = "true" ]; then
             # 1) config 三件套：KPM=y，以及被 KPM select 的 KALLSYMS / KALLSYMS_ALL 必须真的生效
             grep -q '^CONFIG_KPM=y' "$COMMON/out/.config" \
               || { echo "::error::ENABLE_KPM=true 但 CONFIG_KPM 不是 y"; exit 1; }
             grep -q '^CONFIG_KALLSYMS=y' "$COMMON/out/.config" \
               || { echo "::error::CONFIG_KALLSYMS 不是 y，KPM 无法解析符号"; exit 1; }
             grep -q '^CONFIG_KALLSYMS_ALL=y' "$COMMON/out/.config" \
-              || { echo "::error::CONFIG_KALLSYMS_ALL 没被 KPM select 上，KPM 查不到数据符号"; exit 1; }
-            # 2) 编译日志必须有 Kbuild 的 $(info -- KPM is enabled)
+              || { echo "::error::CONFIG_KALLSYMS_ALL 没被 KPM select 上，KPM 拿不到数据符号"; exit 1; }
+            # 2) 编译日志必须有 kernel/Makefile 的 $(info -- KPM is enabled)
             grep -q 'KPM is enabled' "$GITHUB_WORKSPACE/build-builtin.log" \
-              || { echo "::error::编译日志没有 'KPM is enabled'，KPM 没被编进来"; exit 1; }
-            # 3) 目标文件与符号（防「config 开了但没编」）
-            [ -f "$KPM_OBJ" ] || { echo "::error::缺少 out/.../extension/kpm/kpm.o"; exit 1; }
-            [ -f "$KPM_COMPACT" ] || { echo "::error::缺少 out/.../extension/kpm/compact.o"; exit 1; }
-            if [ "${KPM_SYM:-0}" -eq 0 ]; then
-              echo "::error::vmlinux 里没有 sukisu_compact_find_symbol，KPM 没链进内核"
-              exit 1
-            fi
-            echo "::notice::KPM 已链入内核（sukisu_compact_find_symbol ${KPM_SYM} 个 / ${KPM_CFG}）"
+              || { echo "::error::编译日志没有 'KPM is enabled'"; exit 1; }
+            # 3) 语义判据：必须真的走到 y 分支，且不能残留 n 分支的字符串
+            [ "${KPM_ON:-0}" -ge 1 ] \
+              || { echo "::error::vmlinux 里没有 'KPM is built in' 串，KPM 实际没编进去"; exit 1; }
+            [ "${KPM_OFF:-1}" -eq 0 ] \
+              || { echo "::error::vmlinux 里仍出现 'KPM is *not* built in' 串，CONFIG_KPM 未生效"; exit 1; }
+            echo "::notice::KPM 已编入内核（built in ${KPM_ON} / not built in ${KPM_OFF} / ${KPM_CFG}）"
           else
-            # 关掉时必须确认真的关掉，否则开关等于失效
-            if grep -q '^CONFIG_KPM=y' "$COMMON/out/.config"; then
-              echo "::error::ENABLE_KPM=false 但 CONFIG_KPM=y，开关失效"
-              exit 1
-            fi
-            echo "::notice::KPM 未启用（ENABLE_KPM=false），KPM 相关代码不参与编译"
+            # 关掉时必须确认真的关掉：n 分支的字符串必须在，否则说明开关失效
+            [ "${KPM_OFF:-0}" -ge 1 ] \
+              || { echo "::error::ENABLE_KPM=false 但 vmlinux 里没有 'KPM is *not* built in' 串，开关可能失效"; exit 1; }
+            echo "::notice::KPM 未启用（not built in ${KPM_OFF} / ${KPM_CFG}）"
           fi
 
           echo "==== ksu 符号抽样 ===="
