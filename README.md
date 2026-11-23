@@ -10,10 +10,13 @@
 
 | 版本 | 包含 | 说明 |
 | --- | --- | --- |
-| **[v1.1](../../releases/tag/v1.1)** | Nova + SUSFS + KPM | 需要 KPM 模块选这个 |
+| **[v1.2](../../releases/tag/v1.2)** | Nova + SUSFS + KPM + BBG | **推荐**，刷机脚本已修（设备校验误拦、分区探测） |
+| [v1.1](../../releases/tag/v1.1) | Nova + SUSFS + KPM | 需要 KPM 模块选这个 |
 | [v1.0](../../releases/tag/v1.0) | Nova + SUSFS | 稳定基线，不含 KPM |
 
-Release 附件就是可刷入的 AnyKernel3 包本体：**不需要解压，也不要去 Actions 下载 artifact**（artifact 是外层再套一层 zip）。
+> **只下 Release 附件。** 附件（`…AnyKernel3.zip`，约 17 MB）就是可刷包本体，**不需要解压**。
+> 不要用 Actions 的 artifact（`PKG110-builtin-builtin-N.zip`，约 33 MB）：它外面还套了一层 zip，
+> 里面才是可刷包，管理器和 recovery 都刷不进去。artifact 只用于排障留档。
 
 ## 特性
 
@@ -21,14 +24,14 @@ Release 附件就是可刷入的 AnyKernel3 包本体：**不需要解压，也�
 | --- | --- |
 | SukiSU Nova | ✅ 内核内置 |
 | SUSFS | ✅ v2.4.0 |
-| KPM | ✅ KernelPatch 已注入（仅 v1.1） |
-| BBG 防格机（Baseband-guard） | 🔄 已集成，待实机验证 |
+| KPM | ✅ KernelPatch 已注入（v1.1 / v1.2） |
+| BBG 防格机（Baseband-guard） | ✅ 已集成，boot 内 `baseband_guard` 串比对通过 |
 | ZRAM 增强 | ❌ 未启用 |
 
 ## 版本怎么选
 
 - 只要 root + 隐藏，选 **v1.0**（不开 KPM，更少变数）
-- 要用 `.kpm` 模块，选 **v1.1**
+- 要用 `.kpm` 模块，选 **v1.2**（v1.1 同能力但刷机脚本老）
 
 ## 刷入
 1. 只用 **SukiSU Nova 管理器** 刷入本 zip（AnyKernel3，不改 ramdisk，只写活动槽的 `boot`）
@@ -40,9 +43,10 @@ Release 附件就是可刷入的 AnyKernel3 包本体：**不需要解压，也�
 | 约束 | 作用 |
 | --- | --- |
 | `SLOT_SELECT=active` | 杜绝「刷成功但开机还是旧内核」：AK3 在 `/postinstall/tmp` 存在时会自动把槽翻成 `inactive`（OTA 暂存目录一出现就中招），显式固定为活动槽 |
-| `BLOCK=/dev/block/by-name/boot` | 直接给绝对节点，跳过 `plistboot`/`plistreco`/`/proc/mtd`/`platform` 通配等历史启发式（含 recovery-in-boot 机型的分支，本机无关） |
-| `PATCH_VBMETA_FLAG=0` | boot.img 无 ramdisk、包内不带 avb 工具，vbmeta 标记不做任何改写，不依赖 `auto` 的运行时判定 |
-| 写入前自检 + 写入后回读 | 前：槽必须 `_a`/`_b`、`ro.product.device` 必须 `PKG110`、目标必须是块设备；后：把目标分区 kernel 段读回来与包内 `Image` 比 md5，不一致会打印 `❌` 并落 `/data/local/tmp/ak3-verify-fail.log` |
+| `BLOCK=boot` + `IS_SLOT_DEVICE=1` | 用分区名而不是写死 `/dev/block/by-name/boot`：AK3 在名字模式下会依次试 `/dev/block/by-name`、`/dev/block/bootdevice/by-name`、`/dev/block/platform/*/by-name`、`/dev/$part`，管理器自带刷机环境里路径不一定可见。`IS_SLOT_DEVICE=1` 让 AK3 自己追加活动槽后缀 |
+| `PATCH_VBMETA_FLAG=auto` | boot.img 无 ramdisk、包内不带 `avb` 工具，交给 AK3 的 auto 判定（本机实测落为 false），不硬编码 |
+| 设备校验交给 AK3 的 `do.devicecheck` | **不要自己查 `ro.product.device`**：本机实测 `ro.product.device`/`ro.product.vendor.device` 都是 `OP5D2BL1`，只有 `ro.build.product`/`ro.product.model` 是 `PKG110`。AK3 会比四个属性任一命中，单属性硬编码会把正确机型拦掉（commit `05308bb` 那轮的包就是这么刷不进去的） |
+| 写入前自检 + 写入后回读 | 前：槽必须 `_a`/`_b`、`BLOCK` 非空且为块设备（非常规节点只告警）；后：把目标分区 kernel 段读回来与包内 `Image` 比 md5，不一致打印 `❌` 并落 `/data/local/tmp/ak3-verify-fail.log` |
 
 ## 风险
 
