@@ -119,6 +119,31 @@ jobs:
             python3 python3-pip dwarves lz4 device-tree-compiler ccache \
             file libarchive-tools
 
+      # 性能归因用：把「机器多快」变成可比的数字，避免以后只能猜
+      # 「是不是 runner 变慢了」。nproc 决定 make -j 的并行度，cpu.max 是容器配额。
+      - name: 记录 runner 指纹与 CPU 基准
+        run: |
+          set -uo pipefail
+          NPROC=$(nproc)
+          CPUMODEL=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')
+          CPUMAX=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo 不可读)
+          BENCH=$(python3 -c "import hashlib,time;b=b'x'*(1<<20);h=hashlib.sha256();n=160;t=time.time();[h.update(b) for _ in range(n)];d=time.time()-t;print('%.2fs (%.0f MB/s)'%(d,n/d))")
+          echo "nproc=$NPROC"
+          echo "cpu=$CPUMODEL"
+          echo "cpu.max=$CPUMAX"
+          echo "bench=$BENCH"
+          df -h / | tail -1
+          {
+            echo ""
+            echo "### runner 指纹"
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| nproc | $NPROC |"
+            echo "| CPU | $CPUMODEL |"
+            echo "| cgroup cpu.max | $CPUMAX |"
+            echo "| CPU 微基准 sha256 160MB | $BENCH |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 安装 repo 工具
         run: |
           set -euxo pipefail
@@ -767,6 +792,9 @@ jobs:
             tail -10 "$LOG"
           fi
 
+          # 计时 + ccache 命中统计：编译慢到底是「机器慢」还是「缓存没命中」，靠这两组数字区分
+          ccache -s > "$GITHUB_WORKSPACE/ccache-before.txt" 2>&1 || true
+          BUILD_T0=$(date +%s)
           make -j"$(nproc)" \
             LLVM=1 ARCH=arm64 \
             CC="ccache clang" \
@@ -790,6 +818,22 @@ jobs:
 
           echo "==== KSU 预编译提示（来自内核 log）===="
           grep -iE 'SukiSU version|KernelSU Manager package|KPM is|preinit|KSU_NO_PREINIT' "$LOG" | head -10 || true
+          BUILD_T1=$(date +%s)
+          BUILD_SEC=$((BUILD_T1 - BUILD_T0))
+          ccache -s > "$GITHUB_WORKSPACE/ccache-after.txt" 2>&1 || true
+          echo "编译主目标耗时 ${BUILD_SEC}s"
+          echo "== ccache -s（编译后）=="
+          cat "$GITHUB_WORKSPACE/ccache-after.txt" 2>/dev/null || true
+          {
+            echo "| 编译主目标耗时 | ${BUILD_SEC}s |"
+            echo ""
+            echo "<details><summary>ccache -s（编译后）</summary>"
+            echo ""
+            echo '```'
+            cat "$GITHUB_WORKSPACE/ccache-after.txt" 2>/dev/null || echo '无法读取'
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
           tail -15 "$LOG"
 
       - name: 校验 Image 与 KSU 是否真的进了内核
