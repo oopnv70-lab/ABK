@@ -1248,14 +1248,15 @@ jobs:
           # 显式固定 active 直接短路该分支。
           SLOT_SELECT=active;
           
-          # 直接给绝对节点：一次跳过 plistboot / plistreco / /proc/mtd / platform 通配等历史启发式，
-          # 只按活动槽拼 boot$SLOT（ak3-core.sh 会给 /dev/* 路径追加 $SLOT 后缀）。
-          BLOCK=/dev/block/by-name/boot;
+          # boot 分区用分区名，不要写死绝对路径：AK3 在名字模式下会依次试
+          # /dev/block/by-name、/dev/block/bootdevice/by-name、/dev/block/platform/*/by-name、
+          # /dev/$part 等多条候选路径。写死 /dev/block/by-name/boot 看似更"确定"，
+          # 但在管理器自带的刷机环境里那条路径不一定可见，会直接 abort。
+          BLOCK=boot;
           IS_SLOT_DEVICE=1;
           RAMDISK_COMPRESSION=auto;
-          # boot.img 无 ramdisk、包内也不带 avb 工具：vbmeta 标记不做任何改写，显式关掉，
-          # 不依赖 auto 的运行时判定。
-          PATCH_VBMETA_FLAG=0;
+          # boot.img 无 ramdisk、包内不带 avb 工具，用 AK3 的 auto 判定（本机实测落为 false）。
+          PATCH_VBMETA_FLAG=auto;
           . tools/ak3-core.sh;
           
           # ---- 写入前三道自检（setup_ak 在 source 时就执行完，此时 $BLOCK 已是解析后的绝对节点）----
@@ -1263,9 +1264,13 @@ jobs:
             _a|_b) : ;;
             *) abort "活动槽异常（SLOT='$SLOT'），拒绝刷写。";;
           esac
-          DEVCHK=$(getprop ro.product.device)
-          [ "$DEVCHK" = "PKG110" ] || abort "设备不符：ro.product.device='$DEVCHK'，本包仅支持 PKG110。"
-          [ -b "$BLOCK" ] || abort "目标不是块设备：$BLOCK"
+          # 设备校验不在这里做：交给 AK3 的 do.devicecheck（update-binary 行 292-312），
+          # 它会比对 ro.product.device / ro.build.product / ro.product.vendor.device /
+          # ro.vendor.product.device 四个属性中的任一个，命中 device.name1=PKG110 即放行。
+          # 本机实测：ro.product.device = OP5D2BL1，只有 ro.build.product = PKG110，
+          # 所以"只查 ro.product.device"会把正确机型判成不符，直接 abort（曾经的翻车点）。
+          [ -n "$BLOCK" ] || abort "未能确定目标分区，拒绝刷写。"
+          [ -b "$BLOCK" ] || ui_print "  ⚠ 目标节点非常规块设备（$BLOCK），继续尝试"
           ui_print "  活动槽：$SLOT"
           ui_print "  目标分区：$BLOCK"
           
@@ -1325,7 +1330,12 @@ jobs:
           ls -l anykernel.sh Image
           # 生成的刷写脚本必须自洽：语法过关 + 四道约束在位，缺一项就红
           bash -n anykernel.sh || { echo "::error::anykernel.sh 语法错误"; exit 1; }
-          for chk in 'SLOT_SELECT=active;' 'BLOCK=/dev/block/by-name/boot;' 'IS_SLOT_DEVICE=1;' 'PATCH_VBMETA_FLAG=0;' 'verify_kernel_write;'; do
+          # 反向断言：不许出现「只查单个机属性」的写法（ro.product.device 是 OP5D2BL1，
+          # 只查它会把本机判成不符 —— run 20 就是这么刷不进去的）
+          if grep -qE 'DEVCHK=\\$\\(getprop ro\\.product\\.device\\)' anykernel.sh; then
+            echo "::error::anykernel.sh 又出现了只查 ro.product.device 的设备校验，会误拦正确机型"; exit 1
+          fi
+          for chk in 'SLOT_SELECT=active;' 'BLOCK=boot;' 'IS_SLOT_DEVICE=1;' 'PATCH_VBMETA_FLAG=auto;' 'verify_kernel_write;'; do
             grep -qF "$chk" anykernel.sh || { echo "::error::anykernel.sh 缺约束：$chk"; exit 1; }
           done
           grep -qF 'split_boot;' anykernel.sh && grep -qF 'flash_boot;' anykernel.sh \
