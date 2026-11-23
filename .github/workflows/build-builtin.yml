@@ -389,6 +389,40 @@ jobs:
           echo "::notice::SUSFS 补丁应用完成，无冲突"
 
       # ---------------------------------------------------------------------
+      # KernelPatch 工具自检（仅 enable_kpm=true）。放在编译前，是为了让
+      # 「kptools 跑不起来」这种问题在几分钟内暴露，而不是等 40 分钟编译完。
+      #
+      # 为什么 KPM 需要这一步（已核实，不是猜）：
+      #   Nova 的 kernel/extension/kpm/kpm.c 里 sukisu_kpm_bridge() 是这样干的：
+      #       fn = find_kernel_symbol_exact("__arm64_sys_truncate");
+      #       regs.regs[0] = SUKISU_KPM_SUPERCALL_MAGIC; ...
+      #       if (fn(&regs) != SUKISU_KPM_ABI_VERSION) return -EOPNOTSUPP;
+      #   即它把 __arm64_sys_truncate 当作 KernelPatch 的 supercall 入口来调。
+      #   bridge.h 注释也写明 "mirrored in KernelPatch patch/sukisu/supercall.h"。
+      #   ⇒ CONFIG_KPM=y 只是打开 KSU 侧通道；真正的执行体是 KernelPatch 的 kpimg，
+      #     必须由 kptools 追加到 Image 末尾并替换启动入口，否则 PROBE 返回的不是
+      #     ABI_VERSION，管理器就一直显示「KPM 不支持」（实机已复现）。
+      # ---------------------------------------------------------------------
+      - name: KernelPatch 工具自检（仅 KPM）
+        if: env.ENABLE_KPM == 'true'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p kp
+          BASE=https://raw.githubusercontent.com/SukiSU-Nova/SukiSU_patch/main/kpm
+          curl -fsSL --retry 3 --max-time 300 "$BASE/kptools-linux" -o kp/kptools-linux \
+            || { echo "::error::下载 kptools-linux 失败"; exit 1; }
+          curl -fsSL --retry 3 --max-time 300 "$BASE/kpimg" -o kp/kpimg \
+            || { echo "::error::下载 kpimg 失败"; exit 1; }
+          chmod +x kp/kptools-linux
+          ls -l kp/
+          echo "== kptools 版本 =="
+          ./kp/kptools-linux -v || { echo "::error::kptools 无法执行（指令集/权限）"; exit 1; }
+          echo "== kpimg 信息 =="
+          ./kp/kptools-linux -l -k kp/kpimg || { echo "::error::kptools 无法解析 kpimg"; exit 1; }
+          echo "::notice::KernelPatch 工具自检通过（kptools + kpimg 可用）"
+
+      # ---------------------------------------------------------------------
       # 配置 + 编译。CONFIG_KSU 必须显式置 y：
       # drivers/Makefile 用的是 obj-$(CONFIG_KSU)，选项不是 y 就整体不编。
       # ---------------------------------------------------------------------
@@ -709,23 +743,57 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/dist"
 
       # ---------------------------------------------------------------------
-      # 打包 AnyKernel3。
+      # 注入 KernelPatch 到 Image（仅 enable_kpm=true）
       #
-      # 为什么必须这一步：Image 是裸内核，`fastboot flash boot Image` 会直接
-      # 失败 —— boot 分区要的是带 header 的容器（kernel_size / ramdisk /
-      # cmdline / page_size / header_version / AVB 签名）。
+      # 为什么必须在打包之前：kptools 会把 kpimg 追加到 Image 末尾，
+      # 并把内核启动入口改指向 kpimg，kpimg 在内核启动后接管并完成动态修补。
+      # 没有这一步，KSU 侧的 kpm bridge PROBE 永远拿不到 ABI_VERSION，
+      # 管理器就显示「KPM 不支持」（已在你设备上复现）。
       #
-      # 为什么用 AnyKernel3 而不是自己造 boot.img：
-      #   造 boot.img 需要知道本机的 header 参数（page size、header version、
-      #   原 cmdline、ramdisk、AVB 算法），任何一项猜错都是开不了机。
-      #   AnyKernel3 在设备上读「现有的 boot.img」，只把 kernel 换掉再写回，
-      #   header 原封不动沿用 —— 不需要我们采集任何参数。
-      #
-      # 为什么用 split_boot / flash_boot 而不是 dump_boot / write_boot：
-      #   Android 13+ / GKI 2.0 的 ramdisk 在 init_boot 分区，boot.img 里只有
-      #   kernel。dump_boot 会去解包 ramdisk（空），split_boot 只拆 kernel，
-      #   更契合这台机器。
+      # 校验用两条互不依赖的证据：
+      #   1) kpimg 的文件头魔数必须出现在 patched Image 里（说明真的追加了）
+      #   2) kptools -l -i 必须列出 KernelPatch/patch 信息（说明入口已改）
       # ---------------------------------------------------------------------
+      - name: 注入 KernelPatch 到 Image（仅 KPM）
+        if: env.ENABLE_KPM == 'true'
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          test -x kp/kptools-linux || { echo "::error::kptools 不存在，自检步骤没跑？"; exit 1; }
+          test -f dist/Image || { echo "::error::dist/Image 不存在"; exit 1; }
+          BEFORE=$(stat -c%s dist/Image)
+          MAGIC=$(head -c 6 kp/kpimg)
+          echo "kpimg 魔数: $MAGIC"
+          cp dist/Image kp/Image
+          cd kp
+          SKEY=$(python3 -c "import secrets;print(secrets.token_hex(8))")
+          echo "== patch =="
+          ./kptools-linux -p -i Image -k kpimg -s "$SKEY" 2>&1 | tee patch.log
+          # kptools 可能原地改 Image，也可能另存 oImage，两种都接住
+          if [ -f oImage ]; then OUT=oImage; else OUT=Image; fi
+          AFTER=$(stat -c%s "$OUT")
+          echo "Image 大小: $BEFORE -> $AFTER (+$((AFTER-BEFORE)) B)"
+          [ "$AFTER" -gt "$BEFORE" ] || { echo "::error::patch 后 Image 未变大，注入失败"; exit 1; }
+          grep -a -qF "$MAGIC" "$OUT" \
+            || { echo "::error::patched Image 里找不到 kpimg 魔数 $MAGIC，kpimg 没被追加"; exit 1; }
+          echo "== kptools -l =="
+          ./kptools-linux -l -i "$OUT" 2>&1 | tee list.log
+          grep -qiE 'kpatch|kernelpatch|kpimg|superkey|patch' list.log \
+            || { echo "::error::kptools -l 未列出任何 patch 信息，入口替换可能失败"; exit 1; }
+          grep -q 'patched=true' list.log \
+            || { echo "::error::kptools -l 显示 patched 不为 true，注入未生效"; exit 1; }
+          cp "$OUT" ../dist/Image
+          {
+            echo ""
+            echo "### KernelPatch 注入"
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| kpimg 魔数 | \`$MAGIC\` |"
+            echo "| Image 大小 | $BEFORE → $AFTER 字节（+$((AFTER-BEFORE))） |"
+            echo "| superkey | 随机生成、不打印（KPM 走 magic 分派，用不到） |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::KernelPatch 已注入 Image（+$((AFTER-BEFORE)) B）"
+
       - name: 打包 AnyKernel3（可刷入 zip）
         run: |
           set -uo pipefail
