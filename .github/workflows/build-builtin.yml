@@ -768,9 +768,10 @@ jobs:
           cd kp
           SKEY=$(python3 -c "import secrets;print(secrets.token_hex(8))")
           echo "== patch =="
-          ./kptools-linux -p -i Image -k kpimg -s "$SKEY" 2>&1 | tee patch.log
-          # kptools 可能原地改 Image，也可能另存 oImage，两种都接住
-          if [ -f oImage ]; then OUT=oImage; else OUT=Image; fi
+          ./kptools-linux -p -i Image -k kpimg -o Image.kp -s "$SKEY" 2>&1 | tee patch.log
+          # kptools 必须有显式输出路径（实测：不给 -o 会报 "empty out image path"）
+          OUT=Image.kp
+          test -f "$OUT" || { echo "::error::kptools 未生成 Image.kp"; exit 1; }
           AFTER=$(stat -c%s "$OUT")
           echo "Image 大小: $BEFORE -> $AFTER (+$((AFTER-BEFORE)) B)"
           [ "$AFTER" -gt "$BEFORE" ] || { echo "::error::patch 后 Image 未变大，注入失败"; exit 1; }
