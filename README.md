@@ -22,7 +22,8 @@ Release 附件就是可刷入的 AnyKernel3 包本体：**不需要解压，也�
 | SukiSU Nova | ✅ 内核内置 |
 | SUSFS | ✅ v2.4.0 |
 | KPM | ✅ KernelPatch 已注入（仅 v1.1） |
-| ZRAM 增强 / BBG | ❌ 未启用 |
+| BBG 防格机（Baseband-guard） | 🔄 已集成，待实机验证 |
+| ZRAM 增强 | ❌ 未启用 |
 
 ## 版本怎么选
 
@@ -52,6 +53,7 @@ workflow：`.github/workflows/build-builtin.yml`，仅 `workflow_dispatch` 手�
 | `ksu_ref` | builtin | SukiSU Nova 分支 |
 | `enable_susfs` | true | 打 SUSFS 补丁 |
 | `enable_kpm` | false | 开 CONFIG_KPM 并注入 KernelPatch |
+| `enable_bbg` | true | 集成 Baseband-guard 防格机 LSM（源码构建时按 pin 拉取，不入库） |
 
 单轮耗时 18–60 分钟，主要取决于 `repo sync`。
 
@@ -64,10 +66,12 @@ workflow：`.github/workflows/build-builtin.yml`，仅 `workflow_dispatch` 手�
 
 本仓库脚本与文档：**GPL-2.0**（见 [LICENSE](LICENSE)）。
 
-内核本体 GPL-2.0-only；SukiSU-Nova（builtin 分支）GPL-2.0；KernelPatch GPL-2.0；susfs4ksu 仓库未附 LICENSE；AnyKernel3 为 BSD-3-Clause 风格。
+内核本体 GPL-2.0-only；SukiSU-Nova（builtin 分支）GPL-2.0；KernelPatch GPL-2.0；Baseband-guard GPL-2.0；susfs4ksu 仓库未附 LICENSE；AnyKernel3 为 BSD-3-Clause 风格。
 
 逐项说明见 **[NOTICE.md](NOTICE.md)**。
 
+> **许可声明随产物分发**：每个刷机包 zip 内都带 `THIRD-PARTY-NOTICES.md`、`LICENSES/`（含 Baseband-guard 许可原文）与 `SOURCE.md`（逐项 pin 的对应源码指引）。GPL 的义务跟着二进制走，不能只挂在仓库里。
+
 ## 致谢
 
-SukiSU-Nova / KernelSU、susfs4ksu（simonpunk）、AnyKernel3（osm0sis）、KernelPatch（bmax121）、OnePlusOSS 内核源码。
+SukiSU-Nova / KernelSU、susfs4ksu（simonpunk）、AnyKernel3（osm0sis）、KernelPatch（bmax121）、Baseband-guard（vc-teahouse / 秋刀鱼）、OnePlusOSS 内核源码。

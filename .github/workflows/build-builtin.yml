@@ -82,6 +82,8 @@ env:
   # 否则构建产物会随上游漂移，且事后无法复现。
   # 48d9fdea = main @ 2026-11-23「feat: add Android18-7.3 support (#92)」
   BBG_REF: 48d9fdea643bcb41d204541400e9d8656b97a54f
+  # SUSFS 上游 pin（GitLab，非 GitHub 镜像）。产物里的 SOURCE.md 也会引用它。
+  SUSFS_REF: f76b81f2a6bf98e4029cc0c823c054edbec29803
   # stock 内核 release 的后半截（KERNELVERSION=6.1.141 之外的部分）。
   # 必须与设备原厂内核逐字一致：内核 check_modinfo() 拿它做 vermagic 比对，
   # 不匹配则 vendor_dlkm 里所有 .ko 拒绝加载 → 卡第一屏无限重启（无 panic）。
@@ -227,7 +229,7 @@ jobs:
           # 产出的内核会随上游改动而变，也无法判断「这次补丁与上次是否同一份」。
           # f76b81f2 = 2026-11-15，susfs4ksu gki-android14-6.1 分支头，SUSFS v2.4.0
           # 升级时只改这一处，并同步 docs/BASELINE.md
-          SUSFS_COMMIT="f76b81f2a6bf98e4029cc0c823c054edbec29803"
+          SUSFS_COMMIT="${SUSFS_REF}"
           SUSFS_BASE="https://gitlab.com/simonpunk/susfs4ksu/-/raw/${SUSFS_COMMIT}/kernel_patches"
 
           curl -fsSL --retry 3 --max-time 90 \
@@ -1039,6 +1041,79 @@ jobs:
           ls -lh "$GITHUB_WORKSPACE/dist"
 
       # ---------------------------------------------------------------------
+      # 许可证与源码指引必须**随产物走**，不能只挂在仓库里。
+      # 原因：GPL 的义务跟着二进制分发走。别人只拿到刷机包时，也应该能查到
+      #   ① 这个 Image 里有哪些第三方代码
+      #   ② 各自什么许可（原文）
+      #   ③ 对应源码在哪个仓库的哪个 commit
+      # 所以 THIRD-PARTY-NOTICES.md / LICENSES/ / SOURCE.md 全部进 dist/，
+      # 并在下一步打包时塞进 AnyKernel3 zip 根目录。
+      # ---------------------------------------------------------------------
+      - name: 产物内附许可声明与源码指引
+        run: |
+          set -euo pipefail
+          COMMON="$KERNEL_PLATFORM/common"
+          DIST="$GITHUB_WORKSPACE/dist"
+          test -d "$DIST" || { echo "::error::dist 不存在，上一步没跑？"; exit 1; }
+
+          mkdir -p "$DIST/LICENSES"
+          cp "$GITHUB_WORKSPACE/NOTICE.md" "$DIST/THIRD-PARTY-NOTICES.md"
+          cp "$GITHUB_WORKSPACE/LICENSE"   "$DIST/LICENSES/GPL-2.0.txt"
+          echo "  收入 dist/: THIRD-PARTY-NOTICES.md ($(wc -c < "$GITHUB_WORKSPACE/NOTICE.md") B)"
+          echo "  收入 dist/: LICENSES/GPL-2.0.txt ($(wc -c < "$GITHUB_WORKSPACE/LICENSE") B)"
+
+          # BBG 是 GPL-2.0：发放含它的二进制时，许可原文必须随之分发
+          if [ "$ENABLE_BBG" = "true" ]; then
+            BBG_LIC="$COMMON/security/baseband-guard/LICENSE"
+            test -f "$BBG_LIC" || { echo "::error::上游 BBG 缺 LICENSE 文件，产物无法合规分发"; exit 1; }
+            cp "$BBG_LIC" "$DIST/LICENSES/Baseband-guard-LICENSE.txt"
+            echo "  收入 dist/: LICENSES/Baseband-guard-LICENSE.txt ($(wc -c < "$BBG_LIC") B)"
+          fi
+
+          KSU_SHA=$(git -C "$KERNEL_PLATFORM/KernelSU" rev-parse HEAD 2>/dev/null || echo unknown)
+          if [ "$ENABLE_BBG" = "true" ]; then
+            BBG_ROW="| Baseband-guard (BBG) | https://github.com/vc-teahouse/Baseband-guard | \`${BBG_REF}\` |"
+          else
+            BBG_ROW="| Baseband-guard (BBG) | 本次构建未启用 | - |"
+          fi
+
+          cat > "$DIST/SOURCE.md" <<SRC_EOF
+          # 对应源码指引（Corresponding Source）
+
+          本构建产物（Image 与 AnyKernel3 刷机包）内的第三方代码全部来自公开上游，
+          且**逐项固定了 commit**。按下列信息可复现同一产物，满足 GPL-2.0 对二进制
+          分发的源码获取要求。
+
+          ## 构建来源
+
+          - 构建仓库：https://github.com/oopnv70-lab/Ace5-NovaKernel ，commit \`${GITHUB_SHA}\`
+          - 构建流水线：GitHub Actions run ${GITHUB_RUN_ID}
+          - workflow：\`.github/workflows/build-builtin.yml\`（仅 workflow_dispatch 手动触发）
+
+          ## 组件与固定版本
+
+          | 组件 | 上游来源 | pin |
+          | --- | --- | --- |
+          | Linux 内核（GKI android14-6.1） | OnePlusOSS kernel_manifest（分支 \`${MANIFEST_BRANCH}\`，设备 \`${DEVICE_MANIFEST}\`） | 由 repo sync 时的 manifest 决定 |
+          | SukiSU-Nova（内置） | https://github.com/SukiSU-Nova/SukiSU-Nova | 分支 \`${KSU_REF}\`，commit \`${KSU_SHA}\` |
+          | susfs4ksu / SUSFS v2.4.0 | https://gitlab.com/simonpunk/susfs4ksu | \`${SUSFS_REF}\` |
+          ${BBG_ROW}
+          | KernelPatch（kpimg / kptools） | https://github.com/SukiSU-Nova/SukiSU_patch（\`kpm/\`） | 随构建时拉取 |
+          | AnyKernel3 | https://github.com/Osm0sis/AnyKernel3 | 随构建时拉取 |
+
+          ## 许可证
+
+          逐项声明见同目录 \`THIRD-PARTY-NOTICES.md\`，许可原文见 \`LICENSES/\`
+          （其中 \`Baseband-guard-LICENSE.txt\` 来自上游仓库原文）。
+
+          > 本文由构建流程自动生成，内容随本次构建的 pin 变化。
+          SRC_EOF
+
+          echo "==== dist 目录 ===="
+          ls -lh "$DIST" "$DIST/LICENSES"
+          echo "::notice::产物已内附许可声明与源码指引（THIRD-PARTY-NOTICES.md / LICENSES/ / SOURCE.md）"
+
+      # ---------------------------------------------------------------------
       # 注入 KernelPatch 到 Image（仅 enable_kpm=true）
       #
       # 为什么必须在打包之前：kptools 会把 kpimg 追加到 Image 末尾，
@@ -1141,6 +1216,17 @@ jobs:
           echo "=== 包内容 ==="
           ls -l anykernel.sh Image
           ls -l tools/ | head
+
+          # 许可声明与源码指引随包分发：别人只拿到这个 zip 时，也必须能查到
+          # 「里面有哪些第三方代码 / 各自许可原文 / 对应源码在哪个 commit」。
+          mkdir -p LICENSES
+          cp "$GITHUB_WORKSPACE/dist/THIRD-PARTY-NOTICES.md" ./THIRD-PARTY-NOTICES.md
+          cp "$GITHUB_WORKSPACE/dist/SOURCE.md"              ./SOURCE.md
+          for f in "$GITHUB_WORKSPACE"/dist/LICENSES/*; do
+            [ -f "$f" ] && cp "$f" ./LICENSES/
+          done
+          ls -l THIRD-PARTY-NOTICES.md SOURCE.md
+          ls -l LICENSES/
 
           KPM_TAG=""
           if [ "$ENABLE_KPM" = "true" ]; then KPM_TAG="-kpm"; fi
