@@ -11,6 +11,7 @@
 | KernelSU | SukiSU-Nova 的上游项目 | GPL-3.0（本项目未包含其 main 分支代码） | tiann/KernelSU |
 | susfs4ksu | SUSFS 内核补丁 | 上游仓库未附 LICENSE 文件；补丁作用于 GPL-2.0-only 内核树 | simonpunk/susfs4ksu |
 | KernelPatch | kpimg / kptools，KPM 运行时 | **GPL-2.0** | bmax121/KernelPatch |
+| Baseband-guard（BBG） | 防格机 LSM，内核内置（按需编译） | **GPL-2.0**（上游 `LICENSE`，17,984 B） | vc-teahouse/Baseband-guard |
 | AnyKernel3 | 刷机包脚本与打包模板 | **BSD-3-Clause 风格**，全文见 [LICENSES/AnyKernel3-LICENSE.txt](LICENSES/AnyKernel3-LICENSE.txt) | Osm0sis/AnyKernel3 |
 
 ## 说明
@@ -20,3 +21,5 @@
 3. AnyKernel3 要求二进制再分发时随包保留其 LICENSE：每个刷机包 zip 内均已内含 `LICENSE` 文件。
 4. susfs4ksu 上游未提供 LICENSE 文件，此处按其作用对象标注为内核 GPL-2.0-only 的一部分；若上游后续声明变更，以原文为准。
 5. 若本文档与任一上游 LICENSE 原文冲突，以原文为准。
+6. **Baseband-guard 的源码不入本仓库**：构建时按其 pin 的 commit（见 `.github/workflows/build-builtin.yml` 的 `BBG_REF`，当前 `48d9fdea`）从上游拉取，仓库内只保留接入脚本与校验逻辑。该组件为 GPL-2.0，完整对应源码即上游该 commit 的仓库内容。
+7. 同理，susfs4ksu 补丁同样在构建时按 pin 拉取，仓库不保存其代码副本。
