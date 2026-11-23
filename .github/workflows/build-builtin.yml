@@ -52,6 +52,11 @@ on:
         required: true
         type: boolean
         default: false
+      enable_bbg:
+        description: '打开 CONFIG_BBG（Baseband-guard 防格机 LSM；构建时按 pin 拉取源码，不入库）'
+        required: true
+        type: boolean
+        default: true
       stock_localversion:
         description: 'stock 内核 release 的后缀，必须与设备原厂 uname -r 的后半截逐字一致'
         required: false
@@ -72,6 +77,11 @@ env:
   KSU_REF: ${{ inputs.ksu_ref || 'builtin' }}
   ENABLE_SUSFS: ${{ inputs.enable_susfs == true && 'true' || 'false' }}
   ENABLE_KPM: ${{ inputs.enable_kpm == true && 'true' || 'false' }}
+  ENABLE_BBG: ${{ inputs.enable_bbg == true && 'true' || 'false' }}
+  # Baseband-guard 上游 pin。和 SUSFS 一样固定 commit，不用分支头：
+  # 否则构建产物会随上游漂移，且事后无法复现。
+  # 48d9fdea = main @ 2026-11-23「feat: add Android18-7.3 support (#92)」
+  BBG_REF: 48d9fdea643bcb41d204541400e9d8656b97a54f
   # stock 内核 release 的后半截（KERNELVERSION=6.1.141 之外的部分）。
   # 必须与设备原厂内核逐字一致：内核 check_modinfo() 拿它做 vermagic 比对，
   # 不匹配则 vendor_dlkm 里所有 .ko 拒绝加载 → 卡第一屏无限重启（无 panic）。
@@ -459,6 +469,96 @@ jobs:
           echo "::notice::已生成 SUSFS 期望符号集（${EXP_N} 个），编译后将逐项比对"
 
       # ---------------------------------------------------------------------
+      # 集成 Baseband-guard（BBG 防格机）。只有 enable_bbg=true 才跑。
+      #
+      # 规矩同 SUSFS：源码**不入库**，构建时按固定 commit 拉取。
+      # 仓库里只留「两行接入 + 校验」，别人的代码一行都不复制。
+      #
+      # 它是什么：独立 LSM，拦「不可信进程」对块设备的写。
+      #   不可信 = SELinux 域为 u:r:su / u:r:ksu / u:r:magisk 的进程及其后代
+      #   （tracing.c 的 bprm_creds_for_exec 打标记，cred_prepare/transfer 继承）。
+      #   拦的 hook：file_permission(MAY_WRITE) / file_ioctl(破坏性命令) /
+      #              inode_setattr(块设备节点的 chmod/chown/truncate)
+      #
+      # 白名单是「分区名」而不是路径：走 bdev->bd_meta_info->volname（GPT 标签）。
+      # 本机实测标签：boot_a/init_boot_a/recovery_a/metadata/misc/userdata 等可写，
+      # persist/modemst1/modemst2/super 一律拦下 —— 正是防格机想拦的地方。
+      #
+      # 关键红线（Kconfig 帮助文本自己写着）：BBG_BLOCK_BOOT / BBG_BLOCK_RECOVERY
+      # 一旦打开，系统内就无法刷 boot，只能 recovery/fastboot。而本机 TWRP 不可用、
+      # 唯一刷入路径就是 SukiSU Nova 管理器（ksu 域=不可信），开了等于自锁。
+      # ⇒ 这两项永久保持 n，下面的配置段和校验段都有硬检查。
+      # ---------------------------------------------------------------------
+      - name: 集成 Baseband-guard（BBG 防格机，构建时拉取）
+        if: env.ENABLE_BBG == 'true'
+        run: |
+          set -euxo pipefail
+          COMMON="$KERNEL_PLATFORM/common"
+          SEC="$COMMON/security"
+          BBG="$SEC/baseband-guard"
+          INFO="$GITHUB_WORKSPACE/bbg-integration.log"
+
+          test -d "$SEC" || { echo "::error::找不到 $SEC"; exit 1; }
+
+          # 放进 common/security/ 里而不是仓库根：Kbuild 只认 srctree 内的目录，
+          # 放外面编译时根本不会被扫到。
+          rm -rf "$BBG"
+          git clone https://github.com/vc-teahouse/Baseband-guard.git "$BBG"
+          git -C "$BBG" checkout -q "$BBG_REF"
+
+          SHA=$(git -C "$BBG" rev-parse HEAD)
+          echo "pin 期望: $BBG_REF"
+          echo "实际 HEAD: $SHA"
+          [ "$SHA" = "$BBG_REF" ] || { echo "::error::BBG 没有落在 pin 的 commit 上（$SHA）"; exit 1; }
+
+          # BBG 的 Makefile 里有一句 `test -f .git/shallow && git fetch --unshallow`。
+          # 我们用的是完整 clone（不 shallow）不会触发；但把标记文件清掉，
+          # 免得以后有人给 clone 加 --depth 时在无网环境被 git 卡住。
+          rm -f "$BBG/.git/shallow"
+
+          # 起个提交说明留档：产物里能查到到底用的是哪个 commit
+          {
+            echo "Baseband-guard"
+            echo "  repo: https://github.com/vc-teahouse/Baseband-guard"
+            echo "  pin : $SHA"
+            echo "  date: $(git -C "$BBG" log -1 --format=%cd --date=iso)"
+            echo "  desc: $(git -C "$BBG" log -1 --format=%s)"
+            echo "  license: $(ls "$BBG"/LICENSE* 2>/dev/null | head -1 | xargs -r grep -m1 -o 'GNU GENERAL PUBLIC LICENSE.*' || echo GPL-2.0)"
+            echo "  enforcement: 编译期硬编码 BB_ENFORCING=1（无运行期开关，无 dry-run）"
+            echo "  BLOCK_BOOT=n / BLOCK_RECOVERY=n（开了会在系统内刷不了 boot）"
+          } | tee "$INFO"
+
+          # ---- 接入 security/ 的两行（与 setup.sh 等价，只是不用它的符号链接）----
+          grep -q 'baseband-guard/' "$SEC/Makefile" \
+            || printf '\nobj-$(CONFIG_BBG) += baseband-guard/\n' >> "$SEC/Makefile"
+
+          # Kconfig 插在**最后一个** endmenu 之前（setup.sh 的做法）。
+          # 不能用 `0,/endmenu/`：匹配到第一个就把 source 插进了 menu 中间。
+          if ! grep -q 'security/baseband-guard/Kconfig' "$SEC/Kconfig"; then
+            awk '{ a[NR]=$0 }
+                 END { last=0;
+                       for (i=1;i<=NR;i++) if (a[i] ~ /^endmenu[[:space:]]*$/) last=i;
+                       for (i=1;i<=NR;i++) {
+                         if (i==last) print "source \"security/baseband-guard/Kconfig\"";
+                         print a[i];
+                       } }' "$SEC/Kconfig" > "$SEC/Kconfig.tmp"
+            mv "$SEC/Kconfig.tmp" "$SEC/Kconfig"
+          fi
+
+          # ---- 前置条件自检：BBG 要的东西这棵树必须有 ----
+          test -f "$SEC/selinux/include/objsec.h" \
+            || { echo "::error::缺 security/selinux/include/objsec.h（BBG 的 kernel_compat.h 要 include）"; exit 1; }
+          test -f "$COMMON/block/blk.h" \
+            || { echo "::error::缺 common/block/blk.h（BBG Makefile 用 -I\$(srctree)/block）"; exit 1; }
+          grep -q '#define DEFINE_LSM(lsm)' "$COMMON/include/linux/lsm_hooks.h" \
+            || { echo "::error::这棵树没有 DEFINE_LSM，走不了现代 LSM 路线（BBG 会退化成改 selinux 源码）"; exit 1; }
+
+          echo "==== 挂接结果 ===="
+          grep -n 'baseband-guard' "$SEC/Makefile"
+          grep -n 'baseband-guard' "$SEC/Kconfig"
+          echo "::notice::Baseband-guard 已接入（pin ${SHA:0:10}），配置在下一步按开关下发"
+
+      # ---------------------------------------------------------------------
       # KernelPatch 工具自检（仅 enable_kpm=true）。放在编译前，是为了让
       # 「kptools 跑不起来」这种问题在几分钟内暴露，而不是等 40 分钟编译完。
       #
@@ -574,6 +674,42 @@ jobs:
             scripts/config --file out/.config -d KPM
           fi
 
+          # ---- BBG（Baseband-guard 防格机）----
+          # 只开功能本身；BLOCK_BOOT / BLOCK_RECOVERY 必须明确关掉：
+          # 开了就等于「系统内刷不了 boot」，而本机唯一刷入路径是管理器（ksu 域），
+          # 会被自己锁死（TWRP 不可用，只能靠 fastboot 救）。
+          if [ "$ENABLE_BBG" = "true" ]; then
+            scripts/config --file out/.config -e BBG
+            scripts/config --file out/.config -d BBG_BLOCK_BOOT
+            scripts/config --file out/.config -d BBG_BLOCK_RECOVERY
+
+            # CONFIG_LSM 必须包含 baseband_guard，否则 BBG 的 Makefile 直接
+            # $(error) 中止构建（这是它自己的门禁，不是我们加的）。
+            # 顺序要求：**追加到末尾**。原因：BBG 注册 lbs_cred blob，
+            # blob 偏移按 CONFIG_LSM 顺序分配；追加末尾可保证 selinux 的偏移
+            # 一个字都不变，SUSFS 侧那些按 selinux 结构体解析的代码零扰动。
+            # 另外 BBG 在 bprm_creds_for_exec 里读 selinux sid，排在 selinux
+            # 之后也最稳。
+            CURLSM=$(grep -m1 '^CONFIG_LSM=' out/.config | sed -E 's/^CONFIG_LSM="(.*)"$/\1/')
+            if [ -z "$CURLSM" ]; then
+              # gki_defconfig 走的是 Kconfig default，此时 .config 里还没有这一行，
+              # 用 security/Kconfig 的默认值作为基线（与 stock 一致）。
+              CURLSM="landlock,lockdown,yama,loadpin,safesetid,integrity,selinux,smack,tomoyo,apparmor,bpf"
+              echo "  .config 里还没有 CONFIG_LSM，按默认基线拼接"
+            fi
+            case ",$CURLSM," in
+              *,baseband_guard,*) NEWLSM="$CURLSM" ;;
+              *)                  NEWLSM="$CURLSM,baseband_guard" ;;
+            esac
+            sed -i "s|^CONFIG_LSM=.*|CONFIG_LSM=\"$NEWLSM\"|" out/.config
+            if ! grep -q '^CONFIG_LSM=' out/.config; then
+              echo "CONFIG_LSM=\"$NEWLSM\"" >> out/.config
+            fi
+            echo "  .config: $(grep '^CONFIG_LSM=' out/.config)"
+          else
+            scripts/config --file out/.config -d BBG
+          fi
+
           # ---- 让 kernel release 精确等于 stock，否则 vendor 模块全部拒绝加载 ----
           # 内核 check_modinfo() 逐字节比较 vermagic；不匹配就 -ENOEXEC，
           # vendor_dlkm 里所有 .ko 加载失败 → 卡第一屏无限重启（无 panic）。
@@ -608,7 +744,7 @@ jobs:
 
           echo "==== 关键配置确认 ===="
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E '^CONFIG_(KSU|KSU_SUSFS|KPM|KALLSYMS|LOCALVERSION)' out/.config | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -E '^CONFIG_(KSU|KSU_SUSFS|KPM|KALLSYMS|LOCALVERSION|BBG|LSM)' out/.config | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           if ! grep -q '^CONFIG_KSU=y' out/.config; then
             echo "::error::CONFIG_KSU 不是 y，KSU 不会被编进内核"
@@ -821,6 +957,60 @@ jobs:
             echo "::notice::KPM 未启用（not built in ${KPM_OFF} / ${KPM_CFG}）"
           fi
 
+          # ---- BBG 校验：按 ENABLE_BBG 双向硬校验 ----
+          # 判据分三层，全部是「能反证」的：
+          #   1) .config：BBG=y，且两个 BLOCK_* 必须为 not set（开了会自锁）
+          #   2) CONFIG_LSM：必须含 baseband_guard，且必须排在 selinux 之后
+          #      （blob 偏移与 bprm 时序都依赖这个顺序）
+          #   3) 二进制：BBG 的 hook 函数符号必须在 vmlinux 里，
+          #      另加 deny 日志字符串 —— 光看 config 不能证明代码真的进去了
+          BBG_CFG=$(grep -E '^CONFIG_BBG=|^CONFIG_BBG_BLOCK_BOOT|^CONFIG_BBG_BLOCK_RECOVERY|^CONFIG_LSM=' \
+                      "$COMMON/out/.config" | tr '\n' ' ')
+          LSMVAL=$(grep -m1 '^CONFIG_LSM=' "$COMMON/out/.config" | sed -E 's/^CONFIG_LSM="(.*)"$/\1/')
+          BBG_SYM=$(nm "$VMLINUX" 2>/dev/null | grep -cE ' [tT] (bb_file_permission|bb_inode_setattr|bb_file_ioctl|bb_cred_prepare|bb_cred_transfer|bb_bprm_set_creds)$' || true)
+          BBG_DENY=$(strings "$VMLINUX" | grep -cF 'baseband_guard: deny ' || true)
+          {
+            echo "| BBG 相关 config | \`${BBG_CFG}\` |"
+            echo "| vmlinux BBG hook 符号数 | ${BBG_SYM} |"
+            echo "| vmlinux 'baseband_guard: deny' 串 | ${BBG_DENY} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${ENABLE_BBG:-false}" = "true" ]; then
+            grep -q '^CONFIG_BBG=y' "$COMMON/out/.config" \
+              || { echo "::error::ENABLE_BBG=true 但 CONFIG_BBG 不是 y（可能 SECURITY 依赖没满足）"; exit 1; }
+            # 这两条是红线：开了 BBG_BLOCK_BOOT，管理器就刷不回内核了
+            grep -q '^# CONFIG_BBG_BLOCK_BOOT is not set' "$COMMON/out/.config" \
+              || { echo "::error::CONFIG_BBG_BLOCK_BOOT 不是 n！开了会在系统内刷不了 boot（本机 TWRP 不可用，等于自锁）"; exit 1; }
+            grep -q '^# CONFIG_BBG_BLOCK_RECOVERY is not set' "$COMMON/out/.config" \
+              || { echo "::error::CONFIG_BBG_BLOCK_RECOVERY 不是 n！"; exit 1; }
+
+            case ",${LSMVAL}," in
+              *,baseband_guard,*) : ;;
+              *) echo "::error::CONFIG_LSM 里没有 baseband_guard：'${LSMVAL}'"; exit 1 ;;
+            esac
+            IDX_SEL=$(echo ",${LSMVAL}," | awk -F, '{for(i=1;i<=NF;i++) if($i=="selinux"){print i; exit}}')
+            IDX_BBG=$(echo ",${LSMVAL}," | awk -F, '{for(i=1;i<=NF;i++) if($i=="baseband_guard"){print i; exit}}')
+            echo "  CONFIG_LSM 顺序：selinux=#${IDX_SEL:-?} baseband_guard=#${IDX_BBG:-?}"
+            [ "${IDX_BBG:-0}" -gt "${IDX_SEL:-0}" ] \
+              || { echo "::error::baseband_guard 必须排在 selinux 之后（blob 偏移/时序依赖）"; exit 1; }
+
+            # 编译日志：BBG 的 Makefile 自己会打印这两行
+            grep -qF 'BBG was enabled!' "$GITHUB_WORKSPACE/build-builtin.log" \
+              || { echo "::error::编译日志没有 'BBG was enabled!'，BBG 目录没被 Kbuild 扫到"; exit 1; }
+            grep -qF 'Baseband_guard was found in CONFIG_LSM' "$GITHUB_WORKSPACE/build-builtin.log" \
+              || { echo "::error::编译日志没有 'Baseband_guard was found in CONFIG_LSM'"; exit 1; }
+
+            [ "${BBG_SYM:-0}" -ge 5 ] \
+              || { echo "::error::vmlinux 里 BBG hook 符号只有 ${BBG_SYM} 个（应≥5），BBG 没真正编进去"; exit 1; }
+            [ "${BBG_DENY:-0}" -ge 1 ] \
+              || { echo "::error::vmlinux 里没有 'baseband_guard: deny' 串，拒绝路径没进内核"; exit 1; }
+            echo "::notice::BBG 已编入内核（hook 符号 ${BBG_SYM} 个 / deny 串 ${BBG_DENY} / LSM 顺序 selinux<baseband_guard / 两个 BLOCK_* 均为 n）"
+          else
+            grep -q '^# CONFIG_BBG is not set' "$COMMON/out/.config" \
+              || { echo "::error::ENABLE_BBG=false 但 CONFIG_BBG 不是 not set，开关可能失效"; exit 1; }
+            echo "::notice::BBG 未启用（${BBG_CFG}）"
+          fi
+
           echo "==== ksu 符号抽样 ===="
           nm "$COMMON/out/vmlinux" 2>/dev/null | grep -E ' [tTdDbBrR] (ksu_|kernelsu_)' | head -15 || true
           echo "==== 版本串 ===="
@@ -840,7 +1030,7 @@ jobs:
           cp "$COMMON/out/.config" "$GITHUB_WORKSPACE/dist/.config"
           # 把 SUSFS 的「证据」一起收进产物：patch 全量日志 + 期望符号集。
           # 没有这两份，事后无法证明「132 个 hunk 到底怎么落位的」。
-          for f in susfs-patch.log susfs_expected.txt susfs-fuzz.diff; do
+          for f in susfs-patch.log susfs_expected.txt susfs-fuzz.diff bbg-integration.log; do
             if [ -f "$GITHUB_WORKSPACE/$f" ]; then
               cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/dist/"
               echo "  收入 dist/: $f ($(wc -l < "$GITHUB_WORKSPACE/$f") 行)"
@@ -954,7 +1144,9 @@ jobs:
 
           KPM_TAG=""
           if [ "$ENABLE_KPM" = "true" ]; then KPM_TAG="-kpm"; fi
-          ZIP="$GITHUB_WORKSPACE/dist/PKG110-$KSU_REF${KPM_TAG}-AnyKernel3-$GITHUB_RUN_NUMBER.zip"
+          BBG_TAG=""
+          if [ "$ENABLE_BBG" = "true" ]; then BBG_TAG="-bbg"; fi
+          ZIP="$GITHUB_WORKSPACE/dist/PKG110-$KSU_REF${KPM_TAG}${BBG_TAG}-AnyKernel3-$GITHUB_RUN_NUMBER.zip"
           rm -f "$ZIP"
           zip -r9 "$ZIP" . -x '*.git*' >/dev/null || { echo "::error::zip 失败"; exit 1; }
           ls -lh "$ZIP"
