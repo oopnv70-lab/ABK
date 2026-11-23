@@ -304,6 +304,25 @@ jobs:
             echo "::notice::SUSFS 补丁全部 hunk 严格匹配，无 fuzz"
           fi
           echo "  hunk 结果：fuzz ${FUZZ_N} 处 / 行号偏移 ${OFFSET_N} 处"
+
+          # ---- fuzz 的真实落位：patch 只说「模糊打入」，git diff 才说「打进哪里」 ----
+          # 只对 fuzz 文件做 diff（全量 diff 没必要），落盘 + 打印，供人工判定语义是否等价。
+          if [ "${FUZZ_N:-0}" -gt 0 ]; then
+            FUZZ_FILES=$(awk '/^patching file/{f=$3} /with fuzz/{print f}' "$LOG" | sort -u | tr '\n' ' ')
+            echo "== fuzz 文件: ${FUZZ_FILES}"
+            if git -C "$COMMON" rev-parse --git-dir >/dev/null 2>&1; then
+              # shellcheck disable=SC2086
+              git -C "$COMMON" diff -- $FUZZ_FILES > "$GITHUB_WORKSPACE/susfs-fuzz.diff" 2>/dev/null || true
+              echo "  fuzz 落位 diff：$(wc -l < "$GITHUB_WORKSPACE/susfs-fuzz.diff") 行（随 artifact 保存）"
+              head -160 "$GITHUB_WORKSPACE/susfs-fuzz.diff" || true
+            else
+              echo "  $COMMON 不是 git 仓库，退化为直接打印文件片段"
+              for f in $FUZZ_FILES; do
+                echo "--- $f（前 40 行含 susfs 的行）"
+                grep -n -i 'susfs' "$f" | head -20 || true
+              done
+            fi
+          fi
           grep -E '^patching file' "$LOG" | head -40 || true
           grep -E 'FAILED|ignored' "$LOG" | head -20 || true
           echo "  patch 退出码: $PRC"
@@ -821,7 +840,7 @@ jobs:
           cp "$COMMON/out/.config" "$GITHUB_WORKSPACE/dist/.config"
           # 把 SUSFS 的「证据」一起收进产物：patch 全量日志 + 期望符号集。
           # 没有这两份，事后无法证明「132 个 hunk 到底怎么落位的」。
-          for f in susfs-patch.log susfs_expected.txt; do
+          for f in susfs-patch.log susfs_expected.txt susfs-fuzz.diff; do
             if [ -f "$GITHUB_WORKSPACE/$f" ]; then
               cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/dist/"
               echo "  收入 dist/: $f ($(wc -l < "$GITHUB_WORKSPACE/$f") 行)"
