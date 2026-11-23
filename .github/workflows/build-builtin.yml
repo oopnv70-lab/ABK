@@ -213,10 +213,17 @@ jobs:
           PATCH="$GITHUB_WORKSPACE/susfs.patch"
           LOG="$GITHUB_WORKSPACE/susfs-patch.log"
 
+          # 上游 pin 到具体 commit：否则每次构建都跟分支头漂移，同一份 workflow
+          # 产出的内核会随上游改动而变，也无法判断「这次补丁与上次是否同一份」。
+          # f76b81f2 = 2026-11-15，susfs4ksu gki-android14-6.1 分支头，SUSFS v2.4.0
+          # 升级时只改这一处，并同步 docs/BASELINE.md
+          SUSFS_COMMIT="f76b81f2a6bf98e4029cc0c823c054edbec29803"
+          SUSFS_BASE="https://gitlab.com/simonpunk/susfs4ksu/-/raw/${SUSFS_COMMIT}/kernel_patches"
+
           curl -fsSL --retry 3 --max-time 90 \
-            "https://gitlab.com/simonpunk/susfs4ksu/-/raw/gki-android14-6.1/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch" \
+            "$SUSFS_BASE/50_add_susfs_in_gki-android14-6.1.patch" \
             -o "$PATCH" || { echo "::error::下载 SUSFS 补丁失败"; exit 1; }
-          echo "SUSFS 补丁：$(wc -c < "$PATCH") 字节，$(grep -c '^diff --git' "$PATCH") 个文件"
+          echo "SUSFS 补丁：$(wc -c < "$PATCH") 字节，$(grep -c '^diff --git' "$PATCH") 个文件，pin=${SUSFS_COMMIT:0:8}"
 
           cd "$COMMON"
 
@@ -224,7 +231,7 @@ jobs:
           # 该补丁只改已有文件（27 个），fs/susfs.c / include/linux/susfs.h /
           # susfs_def.h 是「新增文件」，susfs4ksu 把它们放在内核补丁目录下单独提供。
           # 少了这三个，patch 能打完但 fs/Makefile 挂的 susfs.o 编不出来。
-          SUSFS_RAW="https://gitlab.com/simonpunk/susfs4ksu/-/raw/gki-android14-6.1/kernel_patches"
+          SUSFS_RAW="$SUSFS_BASE"
           for f in fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h; do
             mkdir -p "$(dirname "$f")"
             curl -fsSL --retry 3 --max-time 90 "$SUSFS_RAW/$f" -o "$f" \
@@ -271,11 +278,34 @@ jobs:
           echo "  共注入 ${#SHIMMED[@]} 处垫片"
 
           echo "== 步骤 2/3：应用补丁 =="
-          # 用 tee：既要落盘又要进 job 日志，不能再把输出藏进 $LOG
-          patch -p1 --forward --no-backup-if-mismatch < "$PATCH" 2>&1 | tee "$LOG" | grep -vE '^(patching file|Hunk #[0-9]+ succeeded)'
-          PRC=${PIPESTATUS[0]}
-          grep -E '^patching file' "$LOG" | wc -l | sed 's/^/  成功定位文件数: /'
-          grep -E 'FAILED|Hunk #[0-9]+ (succeeded|ignored)' "$LOG" | tail -25 || true
+          # 全量落盘，不再过滤 `patching file`，也不再只截末尾 25 行。
+          # 上一版是两个过滤器叠加：文件名被 grep 掉 + tail -25，导致 132 个 hunk
+          # 只有末尾 25 条可见，「无冲突」的结论建立在一份残缺日志上。这段是把证据补回来。
+          patch -p1 --forward --no-backup-if-mismatch < "$PATCH" > "$LOG" 2>&1
+          PRC=$?
+          grep -E '^patching file' "$LOG" | wc -l | sed 's/^/  定位文件数: /'
+          echo "  补丁日志共 $(wc -l < "$LOG") 行（整份作为 artifact 上传）"
+
+          # fuzz = 上下文已有 2 行对不上却仍强行打入，是「落位不精确」的硬信号；
+          # offset 只是行号漂移，两者必须分开统计、fuzz 要点名到文件与 hunk。
+          FUZZ_N=$(grep -c 'with fuzz' "$LOG" || true)
+          OFFSET_N=$(grep -c 'offset [-0-9]* lines' "$LOG" || true)
+          if [ "${FUZZ_N:-0}" -gt 0 ]; then
+            echo "::warning::SUSFS 补丁有 ${FUZZ_N} 处 fuzz 应用（上下文与上游不一致），清单："
+            awk '/^patching file/{f=$3} /with fuzz/{print "  FUZZ  " f "   " $0}' "$LOG"
+            {
+              echo ""
+              echo "### ⚠️ SUSFS 补丁 fuzz 清单（${FUZZ_N} 处）"
+              echo '```'
+              awk '/^patching file/{f=$3} /with fuzz/{print f " :: " $0}' "$LOG"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::notice::SUSFS 补丁全部 hunk 严格匹配，无 fuzz"
+          fi
+          echo "  hunk 结果：fuzz ${FUZZ_N} 处 / 行号偏移 ${OFFSET_N} 处"
+          grep -E '^patching file' "$LOG" | head -40 || true
+          grep -E 'FAILED|ignored' "$LOG" | head -20 || true
           echo "  patch 退出码: $PRC"
           if [ "$PRC" -gt 1 ]; then
             echo "::error::patch 执行异常（rc=$PRC）"
@@ -387,6 +417,27 @@ jobs:
           chk "无冲突标记"                      "! grep -rqE '^(<<<<<<< |>>>>>>> )' fs kernel mm security"
           [ "$fail" -eq 0 ] || exit 1
           echo "::notice::SUSFS 补丁应用完成，无冲突"
+
+          # ---- 生成「必须出现的 susfs 符号集」，供编译后逐项比对 ----
+          # 只收非 static 的 susfs_* 函数定义：static 函数可能被编译器 inline 掉，
+          # 拿它当硬判据会假失败；非 static 的跨文件调用，符号必须留下。
+          python3 - <<'PY' > "$GITHUB_WORKSPACE/susfs_expected.txt"
+          import re
+          names = set()
+          for ln in open('fs/susfs.c', encoding='utf-8', errors='surrogateescape'):
+              if 'static' in ln.split('(')[0]:
+                  continue
+              m = re.match(r'^[A-Za-z_][A-Za-z0-9_ \t\*]*\b(susfs_[a-z0-9_]+)\s*\(', ln)
+              if m:
+                  names.add(m.group(1))
+          for n in sorted(names):
+              print(n)
+          PY
+          EXP_N=$(wc -l < "$GITHUB_WORKSPACE/susfs_expected.txt")
+          echo "  期望符号集（非 static susfs_* 函数）：${EXP_N} 个"
+          [ "${EXP_N:-0}" -ge 30 ] \
+            || { echo "::error::期望符号集只解析出 ${EXP_N} 个，解析逻辑可能失效（预期约 57）"; exit 1; }
+          echo "::notice::已生成 SUSFS 期望符号集（${EXP_N} 个），编译后将逐项比对"
 
       # ---------------------------------------------------------------------
       # KernelPatch 工具自检（仅 enable_kpm=true）。放在编译前，是为了让
@@ -661,19 +712,47 @@ jobs:
           fi
           echo "::notice::test_task_ux 已不再导出（ksymtab 干净）"
 
-          # ---- SUSFS 校验：只有 enable_susfs=true 才要求 ----
+          # ---- SUSFS 校验：不数个数，逐项比对符号集合 ----
+          # 旧版只判「susfs_* 符号数 > 0」，多一个少一个都放行 —— 那不是完整性校验。
+          # 现在拿补丁阶段从上游 fs/susfs.c 解析出的「非 static 函数集」当白名单，
+          # 与 nm 的实际符号集求差集，缺任何一个即失败并列出名字。
           if [ "${ENABLE_SUSFS:-false}" = "true" ]; then
             SUSFS_OBJ="$COMMON/out/fs/susfs.o"
-            SUSFS_SYM=$(nm "$COMMON/out/vmlinux" 2>/dev/null | grep -cE ' [tTdDbBrR] susfs_' || true)
+            VML="$COMMON/out/vmlinux"
+            SUSFS_SYM=$(nm "$VML" 2>/dev/null | grep -cE ' [tTdDbBrR] susfs_' || true)
+            nm "$VML" 2>/dev/null | awk '$2 ~ /^[tTdDbBrR]$/ {print $3}' | grep '^susfs_' | LC_ALL=C sort -u > /tmp/susfs_have.txt || true
+            HAVE_N=$(wc -l < /tmp/susfs_have.txt)
+            EXPECT="$GITHUB_WORKSPACE/susfs_expected.txt"
+            if [ ! -f "$EXPECT" ]; then
+              echo "::error::缺少 susfs_expected.txt（SUSFS 补丁步骤没生成），完整性无法验证"
+              exit 1
+            fi
+            LC_ALL=C sort -u "$EXPECT" > /tmp/susfs_want.txt
+            WANT_N=$(wc -l < /tmp/susfs_want.txt)
+            MISSING=$(LC_ALL=C comm -23 /tmp/susfs_want.txt /tmp/susfs_have.txt || true)
+            MISS_N=$(printf '%s' "$MISSING" | grep -c . || true)
             {
               echo "| out/fs/susfs.o | $([ -f "$SUSFS_OBJ" ] && du -h "$SUSFS_OBJ" | cut -f1 || echo 缺失) |"
-              echo "| vmlinux 中 susfs_* 符号 | ${SUSFS_SYM} 个 |"
+              echo "| vmlinux 中 susfs_* 符号（含 static） | ${SUSFS_SYM} 个 / 去重 ${HAVE_N} 个 |"
+              echo "| 上游期望函数集（非 static） | ${WANT_N} 个 |"
+              echo "| 集合比对缺失 | **${MISS_N}** 个 |"
             } >> "$GITHUB_STEP_SUMMARY"
             if [ "${SUSFS_SYM:-0}" -eq 0 ]; then
               echo "::error::ENABLE_SUSFS=true 但 vmlinux 里没有 susfs_* 符号，SUSFS 没进内核"
               exit 1
             fi
-            echo "::notice::SUSFS 已链入内核（susfs_* 符号 ${SUSFS_SYM} 个）"
+            if [ "${MISS_N:-0}" -gt 0 ]; then
+              {
+                echo ""
+                echo "#### ❌ SUSFS 符号集缺失（${MISS_N} 个）"
+                echo '```'
+                printf '%s\n' "$MISSING"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::SUSFS 符号集不完整，缺 ${MISS_N} 个（清单见 Summary）"
+              exit 1
+            fi
+            echo "::notice::SUSFS 符号集合完整（上游期望 ${WANT_N} 个全部命中 / vmlinux susfs_* 共 ${SUSFS_SYM} 个）"
           fi
 
           # ---- KPM 校验：按 ENABLE_KPM 双向硬校验 ----
@@ -740,6 +819,14 @@ jobs:
           fi
           cp "$SRC" "$GITHUB_WORKSPACE/dist/Image"
           cp "$COMMON/out/.config" "$GITHUB_WORKSPACE/dist/.config"
+          # 把 SUSFS 的「证据」一起收进产物：patch 全量日志 + 期望符号集。
+          # 没有这两份，事后无法证明「132 个 hunk 到底怎么落位的」。
+          for f in susfs-patch.log susfs_expected.txt; do
+            if [ -f "$GITHUB_WORKSPACE/$f" ]; then
+              cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/dist/"
+              echo "  收入 dist/: $f ($(wc -l < "$GITHUB_WORKSPACE/$f") 行)"
+            fi
+          done
           ls -lh "$GITHUB_WORKSPACE/dist"
 
       # ---------------------------------------------------------------------
