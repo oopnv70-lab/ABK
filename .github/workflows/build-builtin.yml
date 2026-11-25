@@ -217,9 +217,19 @@ jobs:
           grep -q 'kernelsu' "$COMMON/drivers/Makefile" || \
             printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$COMMON/drivers/Makefile"
 
-          # drivers/Kconfig：在第一个 endmenu 之前 source
-          grep -q 'drivers/kernelsu/Kconfig' "$COMMON/drivers/Kconfig" || \
-            sed -i '0,/^endmenu/i source "drivers/kernelsu/Kconfig"' "$COMMON/drivers/Kconfig"
+          # drivers/Kconfig：source 插在**最后一个** endmenu 之前（与下方 BBG 同一套写法）。
+          # 不能用 `sed '0,/^endmenu/i'`：GNU sed 对范围内每一行都执行 i 命令，会把 source
+          # 插几百遍（历史翻车点：drivers/Kconfig 被塞了 242 行重复 source）。
+          if ! grep -q 'drivers/kernelsu/Kconfig' "$COMMON/drivers/Kconfig"; then
+            awk '{ a[NR]=$0 }
+                 END { last=0;
+                       for (i=1;i<=NR;i++) if (a[i] ~ /^endmenu[[:space:]]*$/) last=i;
+                       for (i=1;i<=NR;i++) {
+                         if (i==last) print "source \"drivers/kernelsu/Kconfig\"";
+                         print a[i];
+                       } }' "$COMMON/drivers/Kconfig" > "$COMMON/drivers/Kconfig.tmp"
+            mv "$COMMON/drivers/Kconfig.tmp" "$COMMON/drivers/Kconfig"
+          fi
 
           echo "==== 挂接结果 ===="
           grep -n 'kernelsu' "$COMMON/drivers/Makefile" || true
